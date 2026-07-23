@@ -1,0 +1,12 @@
+---
+- name: Create Directory
+  hosts: all
+  become: yes
+
+  tasks:
+
+    - name: Create Project Folder
+      file:
+        path: /opt/project
+        state: directory
+        mode: '0755'

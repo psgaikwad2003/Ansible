@@ -1,0 +1,11 @@
+---
+- name: Copy HTML File
+  hosts: web
+  become: yes
+
+  tasks:
+
+    - name: Copy index.html
+      copy:
+        src: index.html
+        dest: /var/www/html/index.html
