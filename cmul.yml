@@ -1,0 +1,33 @@
+---
+- name: Create multiple users
+  hosts: all
+  become: yes
+
+  vars:
+    users:
+      - dev1
+      - dev2
+      - dev3
+
+  tasks:
+    - name: Create group
+      group:
+        name: developers
+        state: present
+
+    - name: Create users
+      user:
+        name: "{{ item }}"
+        group: developers
+        shell: /bin/bash
+        create_home: yes
+      loop: "{{ users }}"
+
+    - name: Create SSH directory
+      file:
+        path: "/home/{{ item }}/.ssh"
+        state: directory
+        owner: "{{ item }}"
+        group: developers
+        mode: "0700"
+      loop: "{{ users }}"
