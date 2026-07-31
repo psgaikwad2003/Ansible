@@ -4,19 +4,19 @@
   become: yes
 
   vars:
-    app_sort:8080
-    db_host:10.0.0.0
+    app_port: 8080
+    db_host: 10.0.0.0
 
-    tasks:
-      - name:Deploy comfiguration
-        template:
-          src:app.conf.j2
-          dest:/etc/myapp/app.conf
-          owner:root
-          group:root
+  tasks:
+    - name: Deploy configuration
+      template:
+        src: app.conf.j2
+        dest: /etc/myapp/app.conf
+        owner: root
+        group: root
 
-    handlers:
-      - name:Restart application
-        service:
-          name:myapp
-          state:restared
+  handlers:
+    - name: Restart application
+      service:
+        name: myapp
+        state: restarted

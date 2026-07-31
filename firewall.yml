@@ -1,0 +1,27 @@
+---
+- name: Configure Firewall
+  hosts: web
+  become: yes
+
+  tasks:
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Allow HTTP
+      ufw:
+        rule: allow
+        port: "80"
+        proto: "tcp"
+        state: "accept"
+
+    - name: Enable Firewall
+      ufw:
+        state: enabled
+
+    - name: Ensure Nginx Running
+      service:
+        name: nginx
+        state: started
+
