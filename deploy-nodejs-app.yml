@@ -1,0 +1,78 @@
+---
+- name: Deploy Node.js Application
+  hosts: app
+  become: yes
+
+  vars:
+    app_dir: /opt/nodeapp
+    app_port: 3000
+    node_version: "18"
+    git_repo: "https://github.com/example/nodeapp.git"
+
+  tasks:
+
+    - name: Install Node.js Repository
+      shell: curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Install Node.js and Git
+      apt:
+        name:
+          - nodejs
+          - git
+        state: present
+        update_cache: yes
+
+    - name: Create Application Directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: Clone Application Repository
+      git:
+        repo: "{{ git_repo }}"
+        dest: "{{ app_dir }}"
+        version: main
+        force: yes
+
+    - name: Install NPM Dependencies
+      command: npm install --production
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Create Systemd Service File
+      copy:
+        content: |
+          [Unit]
+          Description=Node.js Application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=www-data
+          WorkingDirectory={{ app_dir }}
+          ExecStart=/usr/bin/node {{ app_dir }}/index.js
+          Restart=on-failure
+          Environment=PORT={{ app_port }}
+          Environment=NODE_ENV=production
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/nodeapp.service
+      notify: Reload Systemd
+
+    - name: Start Node.js Application
+      service:
+        name: nodeapp
+        state: started
+        enabled: yes
+
+  handlers:
+
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
