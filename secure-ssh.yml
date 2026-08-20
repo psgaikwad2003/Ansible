@@ -1,0 +1,87 @@
+---
+- name: Harden SSH Configuration
+  hosts: all
+  become: yes
+
+  vars:
+    ssh_port: 2222
+    allowed_users:
+      - devops
+      - admin
+
+  tasks:
+
+    - name: Disable Root Login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PermitRootLogin"
+        line: "PermitRootLogin no"
+        state: present
+      notify: Restart SSH
+
+    - name: Disable Password Authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PasswordAuthentication"
+        line: "PasswordAuthentication no"
+        state: present
+      notify: Restart SSH
+
+    - name: Change Default SSH Port
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?Port "
+        line: "Port {{ ssh_port }}"
+        state: present
+      notify: Restart SSH
+
+    - name: Set Max Authentication Attempts
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?MaxAuthTries"
+        line: "MaxAuthTries 3"
+        state: present
+      notify: Restart SSH
+
+    - name: Allow Only Specific Users
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?AllowUsers"
+        line: "AllowUsers {{ allowed_users | join(' ') }}"
+        state: present
+      notify: Restart SSH
+
+    - name: Disable Empty Passwords
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PermitEmptyPasswords"
+        line: "PermitEmptyPasswords no"
+        state: present
+      notify: Restart SSH
+
+    - name: Set Login Grace Time
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?LoginGraceTime"
+        line: "LoginGraceTime 60"
+        state: present
+      notify: Restart SSH
+
+    - name: Install Fail2Ban
+      apt:
+        name: fail2ban
+        state: present
+        update_cache: yes
+
+    - name: Start Fail2Ban Service
+      service:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+  handlers:
+
+    - name: Restart SSH
+      service:
+        name: sshd
+        state: restarted
