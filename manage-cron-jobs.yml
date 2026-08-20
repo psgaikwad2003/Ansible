@@ -1,0 +1,60 @@
+---
+- name: Manage Scheduled Cron Jobs
+  hosts: all
+  become: yes
+
+  vars:
+    log_retention_days: 30
+    backup_dir: /opt/backups
+
+  tasks:
+
+    - name: Create Backup Directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Schedule Daily Log Cleanup
+      cron:
+        name: "Daily log cleanup"
+        minute: "0"
+        hour: "2"
+        job: "find /var/log -name '*.log' -mtime +{{ log_retention_days }} -delete"
+        user: root
+
+    - name: Schedule Weekly System Backup
+      cron:
+        name: "Weekly system backup"
+        minute: "0"
+        hour: "3"
+        weekday: "0"
+        job: "tar -czf {{ backup_dir }}/system_backup_$(date +\\%F).tar.gz /etc /opt"
+        user: root
+
+    - name: Schedule Hourly Disk Space Alert
+      cron:
+        name: "Hourly disk space check"
+        minute: "0"
+        hour: "*"
+        job: "df -h / | awk 'NR==2{if($5+0 > 85) print \"ALERT: Disk usage at \"$5}' >> /var/log/disk_alerts.log"
+        user: root
+
+    - name: Remove Old Temp Files Every Night
+      cron:
+        name: "Nightly temp cleanup"
+        minute: "30"
+        hour: "1"
+        job: "find /tmp -type f -atime +7 -delete"
+        user: root
+
+    - name: List All Cron Jobs for Root
+      command: crontab -l
+      register: cron_list
+      changed_when: false
+
+    - name: Display Current Cron Jobs
+      debug:
+        msg: "{{ cron_list.stdout_lines }}"
