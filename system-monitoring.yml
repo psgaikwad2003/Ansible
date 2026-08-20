@@ -1,0 +1,68 @@
+---
+- name: System Health Check and Monitoring
+  hosts: all
+  become: yes
+
+  tasks:
+
+    - name: Gather System Facts
+      setup:
+        gather_subset:
+          - hardware
+          - network
+
+    - name: Display Hostname
+      debug:
+        msg: "Hostname: {{ ansible_hostname }}"
+
+    - name: Display OS Information
+      debug:
+        msg: "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Check Disk Usage
+      command: df -h /
+      register: disk_usage
+      changed_when: false
+
+    - name: Show Disk Usage
+      debug:
+        msg: "{{ disk_usage.stdout_lines }}"
+
+    - name: Check Memory Usage
+      command: free -m
+      register: memory_usage
+      changed_when: false
+
+    - name: Show Memory Usage
+      debug:
+        msg: "{{ memory_usage.stdout_lines }}"
+
+    - name: Check Running Services Count
+      shell: systemctl list-units --type=service --state=running | wc -l
+      register: service_count
+      changed_when: false
+
+    - name: Show Running Services Count
+      debug:
+        msg: "Running services: {{ service_count.stdout }}"
+
+    - name: Check System Uptime
+      command: uptime -p
+      register: uptime_result
+      changed_when: false
+
+    - name: Show Uptime
+      debug:
+        msg: "Uptime: {{ uptime_result.stdout }}"
+
+    - name: Save Report to File
+      copy:
+        content: |
+          === System Health Report ===
+          Host: {{ ansible_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          CPU Cores: {{ ansible_processor_cores }}
+          Total RAM: {{ ansible_memtotal_mb }} MB
+          Uptime: {{ uptime_result.stdout }}
+          ============================
+        dest: /tmp/system_health_report.txt
