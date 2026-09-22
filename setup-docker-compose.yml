@@ -1,0 +1,106 @@
+---
+- name: Deploy Multi-Container Microservices Stack with Docker Compose
+  hosts: docker
+  become: yes
+
+  vars:
+    stack_dir: "/opt/microservices-stack"
+    app_port: 8080
+    redis_port: 6379
+    compose_project_name: "prod_stack"
+
+  tasks:
+
+    - name: Install Prerequisites and Docker Compose Plugin
+      apt:
+        name:
+          - docker.io
+          - docker-compose-plugin
+          - python3-pip
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Ensure Docker Service is Running and Enabled
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Create Stack Project Directory
+      file:
+        path: "{{ stack_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Generate Environment Variables File (.env)
+      copy:
+        dest: "{{ stack_dir }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          COMPOSE_PROJECT_NAME={{ compose_project_name }}
+          APP_PORT={{ app_port }}
+          REDIS_PORT={{ redis_port }}
+          NODE_ENV=production
+
+    - name: Deploy Docker Compose Specification
+      copy:
+        dest: "{{ stack_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          services:
+            web:
+              image: nginx:alpine
+              container_name: web-proxy
+              restart: always
+              ports:
+                - "{{ app_port }}:80"
+              depends_on:
+                - cache
+              networks:
+                - app-network
+
+            cache:
+              image: redis:7-alpine
+              container_name: redis-cache
+              restart: always
+              command: ["redis-server", "--appendonly", "yes"]
+              volumes:
+                - redis-data:/data
+              networks:
+                - app-network
+
+          volumes:
+            redis-data:
+              driver: local
+
+          networks:
+            app-network:
+              driver: bridge
+
+    - name: Pull Docker Compose Service Images
+      command: docker compose pull
+      args:
+        chdir: "{{ stack_dir }}"
+
+    - name: Start Docker Compose Stack in Detached Mode
+      command: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ stack_dir }}"
+
+    - name: Inspect Running Compose Containers
+      command: docker compose ps
+      args:
+        chdir: "{{ stack_dir }}"
+      register: compose_ps_output
+      changed_when: false
+
+    - name: Display Stack Running Status
+      debug:
+        msg: "{{ compose_ps_output.stdout_lines }}"

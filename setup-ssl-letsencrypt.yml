@@ -1,0 +1,68 @@
+---
+- name: Automate SSL/TLS Certificate Provisioning with Let's Encrypt Certbot
+  hosts: web
+  become: yes
+
+  vars:
+    certbot_admin_email: "admin@example.com"
+    ssl_domain_name: "example.com"
+    ssl_dhparam_path: "/etc/ssl/certs/dhparam.pem"
+    certbot_auto_renew_hour: "3"
+    certbot_auto_renew_minute: "15"
+
+  tasks:
+
+    - name: Install Certbot and Web Server Plugins
+      apt:
+        name:
+          - certbot
+          - python3-certbot-nginx
+          - python3-certbot-apache
+          - openssl
+        state: present
+        update_cache: yes
+
+    - name: Create Strong Diffie-Hellman Parameters (2048-bit)
+      command: openssl dhparam -out {{ ssl_dhparam_path }} 2048
+      args:
+        creates: "{{ ssl_dhparam_path }}"
+
+    - name: Set Secure Permissions on DH Parameters File
+      file:
+        path: "{{ ssl_dhparam_path }}"
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Request SSL/TLS Certificate in Standalone / Certonly Mode
+      command: >
+        certbot certonly --standalone --non-interactive --agree-tos
+        --email {{ certbot_admin_email }}
+        -d {{ ssl_domain_name }}
+      args:
+        creates: "/etc/letsencrypt/live/{{ ssl_domain_name }}/fullchain.pem"
+      register: certbot_output
+      ignore_errors: yes
+
+    - name: Display Certbot Certificate Result
+      debug:
+        msg: "{{ certbot_output.stdout_lines | default('Certificate already generated or simulated.') }}"
+
+    - name: Schedule Bi-Weekly Automated SSL Renewal Cron Job
+      cron:
+        name: "Let's Encrypt Certificate Auto Renewal"
+        minute: "{{ certbot_auto_renew_minute }}"
+        hour: "{{ certbot_auto_renew_hour }}"
+        weekday: "1,4"
+        job: "certbot renew --quiet --no-self-upgrade --post-hook 'systemctl reload nginx || systemctl reload apache2'"
+        user: root
+
+    - name: Verify Certbot Renewal Timer or Service State
+      command: certbot renew --dry-run
+      register: certbot_dry_run
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show Dry Run Renewal Status
+      debug:
+        msg: "{{ certbot_dry_run.stdout_lines | default(['Dry run skipped']) }}"

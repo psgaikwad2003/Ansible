@@ -1,0 +1,90 @@
+---
+- name: Install and Configure Redis In-Memory Cache Server
+  hosts: cache
+  become: yes
+
+  vars:
+    redis_port: 6379
+    redis_bind_interface: "127.0.0.1"
+    redis_max_memory: "256mb"
+    redis_max_memory_policy: "allkeys-lru"
+    redis_password: "RedisSecretPassword@2026"
+    redis_save_snapshots:
+      - "900 1"
+      - "300 10"
+      - "60 10000"
+
+  tasks:
+
+    - name: Install Redis Server
+      apt:
+        name:
+          - redis-server
+          - redis-tools
+        state: present
+        update_cache: yes
+
+    - name: Configure Redis Port
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^port "
+        line: "port {{ redis_port }}"
+        state: present
+      notify: Restart Redis
+
+    - name: Configure Redis Bind Address
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^bind "
+        line: "bind {{ redis_bind_interface }} ::1"
+        state: present
+      notify: Restart Redis
+
+    - name: Set Redis Memory Limit
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^#? ?maxmemory "
+        line: "maxmemory {{ redis_max_memory }}"
+        state: present
+      notify: Restart Redis
+
+    - name: Set Redis Memory Eviction Policy
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^#? ?maxmemory-policy "
+        line: "maxmemory-policy {{ redis_max_memory_policy }}"
+        state: present
+      notify: Restart Redis
+
+    - name: Set Redis Authentication Password
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^#? ?requirepass "
+        line: "requirepass {{ redis_password }}"
+        state: present
+      notify: Restart Redis
+
+    - name: Ensure Redis Service is Started and Enabled
+      service:
+        name: redis-server
+        state: started
+        enabled: yes
+
+    - name: Verify Redis Service Responsiveness
+      command: "redis-cli -a '{{ redis_password }}' ping"
+      register: redis_ping_result
+      changed_when: false
+      retries: 3
+      delay: 2
+      until: redis_ping_result.stdout == "PONG"
+
+    - name: Display Redis Health Status
+      debug:
+        msg: "Redis health check response: {{ redis_ping_result.stdout }}"
+
+  handlers:
+
+    - name: Restart Redis
+      service:
+        name: redis-server
+        state: restarted

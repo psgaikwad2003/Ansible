@@ -1,0 +1,87 @@
+---
+- name: Install and Configure PostgreSQL Database Server
+  hosts: db
+  become: yes
+
+  vars:
+    postgres_version: "16"
+    db_name: "production_db"
+    db_user: "dbadmin"
+    db_password: "SecureDbPassword@2026"
+    listen_addresses: "localhost"
+    postgres_port: 5432
+
+  tasks:
+
+    - name: Install PostgreSQL Server and Dependencies
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - python3-psycopg2
+          - libpq-dev
+        state: present
+        update_cache: yes
+
+    - name: Ensure PostgreSQL Service is Running and Enabled
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Configure PostgreSQL Listen Addresses
+      lineinfile:
+        path: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
+        regexp: "^#?listen_addresses\\s*="
+        line: "listen_addresses = '{{ listen_addresses }}'"
+        state: present
+      notify: Restart PostgreSQL
+      ignore_errors: yes
+
+    - name: Configure PostgreSQL Port
+      lineinfile:
+        path: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
+        regexp: "^#?port\\s*="
+        line: "port = {{ postgres_port }}"
+        state: present
+      notify: Restart PostgreSQL
+      ignore_errors: yes
+
+    - name: Create PostgreSQL Application Database
+      become_user: postgres
+      postgresql_db:
+        name: "{{ db_name }}"
+        encoding: "UTF-8"
+        state: present
+
+    - name: Create PostgreSQL Database User with Password
+      become_user: postgres
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        state: present
+
+    - name: Grant All Privileges on Database to User
+      become_user: postgres
+      postgresql_privs:
+        type: database
+        database: "{{ db_name }}"
+        roles: "{{ db_user }}"
+        privs: ALL
+        state: present
+
+    - name: Allow MD5 Password Authentication for Database User in pg_hba.conf
+      lineinfile:
+        path: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.conf"
+        line: "host    {{ db_name }}     {{ db_user }}     127.0.0.1/32            scram-sha-256"
+        insertbefore: "^# IPv4 local connections:"
+        state: present
+      notify: Restart PostgreSQL
+      ignore_errors: yes
+
+  handlers:
+
+    - name: Restart PostgreSQL
+      service:
+        name: postgresql
+        state: restarted
