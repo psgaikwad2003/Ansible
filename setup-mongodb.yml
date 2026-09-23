@@ -7,6 +7,11 @@
     mongodb_version: "7.0"
     mongodb_port: 27017
     mongodb_bind_ip: "127.0.0.1"
+    mongodb_admin_user: "siteAdmin"
+    mongodb_admin_password: "MongoAdminPassword@2026"
+    mongodb_app_db: "production_db"
+    mongodb_app_user: "app_user"
+    mongodb_app_password: "AppUserMongoPassword@2026"
 
   tasks:
 
@@ -42,8 +47,96 @@
         state: present
         update_cache: yes
 
+    - name: Deploy Hardened MongoDB Configuration
+      copy:
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # mongod.conf production configuration
+          storage:
+            dbPath: /var/lib/mongodb
+            journal:
+              enabled: true
+            wiredTiger:
+              engineConfig:
+                cacheSizeGB: 1
+
+          systemLog:
+            destination: file
+            logAppend: true
+            path: /var/log/mongodb/mongod.log
+
+          net:
+            port: {{ mongodb_port }}
+            bindIp: {{ mongodb_bind_ip }}
+
+          processManagement:
+            timeZoneInfo: /usr/share/zoneinfo
+
+          security:
+            authorization: enabled
+      notify: Restart MongoDB
+
     - name: Ensure MongoDB Service is Running and Enabled
       service:
         name: mongod
         state: started
         enabled: yes
+
+    - name: Create MongoDB Administrative User
+      shell: >
+        mongosh --quiet --port {{ mongodb_port }} admin --eval '
+          if (!db.getUser("{{ mongodb_admin_user }}")) {
+            db.createUser({
+              user: "{{ mongodb_admin_user }}",
+              pwd: "{{ mongodb_admin_password }}",
+              roles: [ { role: "root", db: "admin" } ]
+            });
+          }
+        '
+      no_log: true
+      ignore_errors: yes
+
+    - name: Create MongoDB Application User and Database
+      shell: >
+        mongosh --quiet -u "{{ mongodb_admin_user }}" -p "{{ mongodb_admin_password }}" --authenticationDatabase admin {{ mongodb_app_db }} --eval '
+          if (!db.getUser("{{ mongodb_app_user }}")) {
+            db.createUser({
+              user: "{{ mongodb_app_user }}",
+              pwd: "{{ mongodb_app_password }}",
+              roles: [ { role: "readWrite", db: "{{ mongodb_app_db }}" } ]
+            });
+          }
+        '
+      no_log: true
+      ignore_errors: yes
+
+    - name: Configure MongoDB Logrotate Policy
+      copy:
+        dest: /etc/logrotate.d/mongodb
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          /var/log/mongodb/*.log {
+              daily
+              missingok
+              rotate 14
+              compress
+              delaycompress
+              notifempty
+              create 0640 mongodb mongodb
+              sharedscripts
+              postrotate
+                  /bin/kill -SIGUSR1 $(cat /var/run/mongodb/mongod.pid 2>/dev/null) 2>/dev/null || true
+              endscript
+          }
+
+  handlers:
+
+    - name: Restart MongoDB
+      service:
+        name: mongod
+        state: restarted
