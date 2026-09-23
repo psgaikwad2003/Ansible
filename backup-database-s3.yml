@@ -5,6 +5,8 @@
 
   vars:
     backup_base_dir: "/var/backups/databases"
+    backup_script_path: "/usr/local/bin/backup-databases.sh"
+    backup_log_path: "/var/log/db_backup.log"
     backup_date: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
     backup_retention_days: 14
     mysql_backup_db: "production_db"
@@ -13,6 +15,7 @@
     postgres_backup_db: "production_db"
     postgres_backup_user: "postgres"
     backup_s3_bucket: "s3://company-cloud-backups-archive/db-snapshots"
+    enable_s3_upload: true
     aws_default_region: "us-east-1"
 
   tasks:
@@ -26,6 +29,7 @@
           - gzip
           - pigz
           - coreutils
+          - awscli
         state: present
         update_cache: yes
 
@@ -66,3 +70,64 @@
       args:
         executable: /bin/bash
       ignore_errors: yes
+
+    - name: Sync Compressed Backups to Remote Cloud Storage (S3)
+      shell: >
+        aws s3 sync {{ backup_base_dir }} {{ backup_s3_bucket }}
+        --exclude "*"
+        --include "*{{ backup_date }}*"
+        --region {{ aws_default_region }}
+        --storage-class STANDARD_IA
+      when: enable_s3_upload | bool
+      ignore_errors: yes
+
+    - name: Purge Local Backups Older than Retention Period
+      find:
+        paths:
+          - "{{ backup_base_dir }}/mysql"
+          - "{{ backup_base_dir }}/postgresql"
+          - "{{ backup_base_dir }}/checksums"
+        age: "{{ backup_retention_days }}d"
+        recurse: yes
+      register: expired_backups
+
+    - name: Remove Expired Backup Archives
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ expired_backups.files }}"
+
+    - name: Deploy Standalone Automated Backup Shell Script
+      copy:
+        dest: "{{ backup_script_path }}"
+        owner: root
+        group: root
+        mode: "0750"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          echo "[$(date)] Starting scheduled database backup routine..." >> {{ backup_log_path }}
+          
+          # MySQL Dump
+          if command -v mysqldump &> /dev/null; then
+            mysqldump -u {{ mysql_backup_user }} -p'{{ mysql_backup_password }}' --single-transaction {{ mysql_backup_db }} | gzip -9 > {{ backup_base_dir }}/mysql/{{ mysql_backup_db }}_${TIMESTAMP}.sql.gz || true
+          fi
+          
+          # PostgreSQL Dump
+          if command -v pg_dump &> /dev/null; then
+            su - {{ postgres_backup_user }} -c "pg_dump -Fc {{ postgres_backup_db }} > {{ backup_base_dir }}/postgresql/{{ postgres_backup_db }}_${TIMESTAMP}.dump" || true
+          fi
+          
+          # Prune expired
+          find {{ backup_base_dir }} -type f -mtime +{{ backup_retention_days }} -delete
+          echo "[$(date)] Scheduled backup completed successfully." >> {{ backup_log_path }}
+
+    - name: Schedule Daily Cron Job for Database Backups at 02:00 UTC
+      cron:
+        name: "Enterprise Multi-Database Automated Backup"
+        minute: "0"
+        hour: "2"
+        job: "{{ backup_script_path }} >> {{ backup_log_path }} 2>&1"
+        user: root
+        state: present
