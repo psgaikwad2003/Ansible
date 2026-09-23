@@ -10,6 +10,7 @@
     node_exporter_user: "node_exporter"
     node_exporter_group: "node_exporter"
     node_exporter_port: 9100
+    node_exporter_textfile_dir: "/var/lib/node_exporter/textfile_collector"
 
   tasks:
 
@@ -57,3 +58,80 @@
       loop:
         - "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
         - "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}"
+
+    - name: Create Textfile Collector Directory
+      file:
+        path: "{{ node_exporter_textfile_dir }}"
+        state: directory
+        owner: "{{ node_exporter_user }}"
+        group: "{{ node_exporter_group }}"
+        mode: "0755"
+
+    - name: Deploy Systemd Service Unit for Node Exporter
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          Documentation=https://github.com/prometheus/node_exporter
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User={{ node_exporter_user }}
+          Group={{ node_exporter_group }}
+          Type=simple
+          ExecStart={{ node_exporter_bin_dir }}/node_exporter \
+            --web.listen-address=:{{ node_exporter_port }} \
+            --collector.textfile.directory={{ node_exporter_textfile_dir }} \
+            --collector.systemd \
+            --collector.processes
+          Restart=always
+          RestartSec=5s
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - Reload Systemd
+        - Restart Node Exporter
+
+    - name: Allow Node Exporter Port in UFW Firewall
+      ufw:
+        rule: allow
+        port: "{{ node_exporter_port }}"
+        proto: tcp
+        comment: "Prometheus Node Exporter Metrics"
+      ignore_errors: yes
+
+    - name: Ensure Node Exporter Service is Running and Enabled
+      service:
+        name: node_exporter
+        state: started
+        enabled: yes
+
+    - name: Verify Metrics Scrape Endpoint
+      uri:
+        url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
+        method: GET
+        status_code: 200
+        return_content: no
+      register: metrics_check
+      retries: 3
+      delay: 2
+      until: metrics_check.status == 200
+      ignore_errors: yes
+
+  handlers:
+
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Restart Node Exporter
+      service:
+        name: node_exporter
+        state: restarted
