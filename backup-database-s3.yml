@@ -1,0 +1,68 @@
+---
+- name: Automated Multi-Database Backup Engine
+  hosts: db
+  become: yes
+
+  vars:
+    backup_base_dir: "/var/backups/databases"
+    backup_date: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    backup_retention_days: 14
+    mysql_backup_db: "production_db"
+    mysql_backup_user: "root"
+    mysql_backup_password: "RootSecurePassword@2026"
+    postgres_backup_db: "production_db"
+    postgres_backup_user: "postgres"
+    backup_s3_bucket: "s3://company-cloud-backups-archive/db-snapshots"
+    aws_default_region: "us-east-1"
+
+  tasks:
+
+    - name: Install Database Client and Compression Utilities
+      apt:
+        name:
+          - mysql-client
+          - postgresql-client-common
+          - postgresql-client
+          - gzip
+          - pigz
+          - coreutils
+        state: present
+        update_cache: yes
+
+    - name: Create Dedicated Backup Directory Hierarchy
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - "{{ backup_base_dir }}"
+        - "{{ backup_base_dir }}/mysql"
+        - "{{ backup_base_dir }}/postgresql"
+        - "{{ backup_base_dir }}/checksums"
+
+    - name: Execute MySQL Database Backup with Gzip Compression
+      shell: >
+        mysqldump -u {{ mysql_backup_user }} -p'{{ mysql_backup_password }}'
+        --single-transaction --quick --routines --triggers {{ mysql_backup_db }}
+        | gzip -9 > {{ backup_base_dir }}/mysql/{{ mysql_backup_db }}_{{ backup_date }}.sql.gz
+      args:
+        executable: /bin/bash
+      no_log: true
+      ignore_errors: yes
+
+    - name: Execute PostgreSQL Database Backup with Gzip Compression
+      become_user: "{{ postgres_backup_user }}"
+      shell: >
+        pg_dump -Fc {{ postgres_backup_db }} > {{ backup_base_dir }}/postgresql/{{ postgres_backup_db }}_{{ backup_date }}.dump
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Generate SHA256 Integrity Checksums for Backups
+      shell: >
+        sha256sum {{ backup_base_dir }}/*/*{{ backup_date }}* > {{ backup_base_dir }}/checksums/checksums_{{ backup_date }}.sha256
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
