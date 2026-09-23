@@ -1,0 +1,48 @@
+---
+- name: Install and Configure Enterprise RabbitMQ Message Broker
+  hosts: message_broker
+  become: yes
+
+  vars:
+    rabbitmq_service_name: "rabbitmq-server"
+    rabbitmq_nodename: "rabbit@localhost"
+    erlang_packages:
+      - erlang-base
+      - erlang-asn1
+      - erlang-crypto
+      - erlang-eldap
+      - erlang-inets
+      - erlang-mnesia
+      - erlang-os-mon
+      - erlang-parsetools
+      - erlang-public-key
+      - erlang-ssl
+      - erlang-syntax-tools
+      - erlang-tools
+      - erlang-xmerl
+
+  tasks:
+
+    - name: Install Erlang Dependencies and Prerequisites
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - apt-transport-https
+        - curl
+        - gnupg
+        - lsb-release
+        - "{{ erlang_packages }}"
+
+    - name: Install RabbitMQ Server
+      apt:
+        name: rabbitmq-server
+        state: present
+        update_cache: yes
+
+    - name: Ensure RabbitMQ Service is Running and Enabled
+      service:
+        name: "{{ rabbitmq_service_name }}"
+        state: started
+        enabled: yes
