@@ -1,0 +1,49 @@
+---
+- name: Install and Configure MongoDB Community Server
+  hosts: db
+  become: yes
+
+  vars:
+    mongodb_version: "7.0"
+    mongodb_port: 27017
+    mongodb_bind_ip: "127.0.0.1"
+
+  tasks:
+
+    - name: Install Prerequisites for MongoDB Repository
+      apt:
+        name:
+          - gnupg
+          - curl
+          - apt-transport-https
+          - python3-pymongo
+        state: present
+        update_cache: yes
+
+    - name: Import MongoDB Official GPG Key
+      apt_key:
+        url: "https://www.mongodb.org/static/pgp/server-{{ mongodb_version }}.asc"
+        state: present
+
+    - name: Configure MongoDB APT Repository
+      apt_repository:
+        repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/{{ mongodb_version }} multiverse"
+        state: present
+        filename: "mongodb-org-{{ mongodb_version }}"
+
+    - name: Install MongoDB Community Edition Packages
+      apt:
+        name:
+          - mongodb-org
+          - mongodb-org-server
+          - mongodb-org-shell
+          - mongodb-org-mongos
+          - mongodb-org-tools
+        state: present
+        update_cache: yes
+
+    - name: Ensure MongoDB Service is Running and Enabled
+      service:
+        name: mongod
+        state: started
+        enabled: yes
