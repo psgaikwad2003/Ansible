@@ -1,0 +1,59 @@
+---
+- name: Install and Configure Prometheus Node Exporter
+  hosts: all
+  become: yes
+
+  vars:
+    node_exporter_version: "1.8.1"
+    node_exporter_arch: "linux-amd64"
+    node_exporter_bin_dir: "/usr/local/bin"
+    node_exporter_user: "node_exporter"
+    node_exporter_group: "node_exporter"
+    node_exporter_port: 9100
+
+  tasks:
+
+    - name: Create Node Exporter System Group
+      group:
+        name: "{{ node_exporter_group }}"
+        system: yes
+        state: present
+
+    - name: Create Node Exporter System User
+      user:
+        name: "{{ node_exporter_user }}"
+        group: "{{ node_exporter_group }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        create_home: no
+        state: present
+
+    - name: Download Prometheus Node Exporter Binary
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
+        dest: "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
+        mode: "0644"
+
+    - name: Extract Node Exporter Archive
+      unarchive:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
+        dest: "/tmp"
+        remote_src: yes
+        creates: "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}/node_exporter"
+
+    - name: Install Node Exporter Binary to Bin Directory
+      copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}/node_exporter"
+        dest: "{{ node_exporter_bin_dir }}/node_exporter"
+        owner: "{{ node_exporter_user }}"
+        group: "{{ node_exporter_group }}"
+        mode: "0755"
+        remote_src: yes
+
+    - name: Cleanup Extracted Node Exporter Files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
+        - "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}"
