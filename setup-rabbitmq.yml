@@ -5,7 +5,14 @@
 
   vars:
     rabbitmq_service_name: "rabbitmq-server"
-    rabbitmq_nodename: "rabbit@localhost"
+    rabbitmq_admin_user: "admin"
+    rabbitmq_admin_password: "AdminSecureRabbitPass@2026"
+    rabbitmq_app_user: "app_worker"
+    rabbitmq_app_password: "WorkerRabbitPass@2026"
+    rabbitmq_vhost: "/production"
+    rabbitmq_amqp_port: 5672
+    rabbitmq_management_port: 15672
+    vm_memory_high_watermark: "0.4"
     erlang_packages:
       - erlang-base
       - erlang-asn1
@@ -46,3 +53,77 @@
         name: "{{ rabbitmq_service_name }}"
         state: started
         enabled: yes
+
+    - name: Enable RabbitMQ Management Web Plugin
+      rabbitmq_plugin:
+        names:
+          - rabbitmq_management
+          - rabbitmq_prometheus
+        state: enabled
+      notify: Restart RabbitMQ
+
+    - name: Configure RabbitMQ Resource Limits and Memory Watermark
+      copy:
+        dest: /etc/rabbitmq/rabbitmq.conf
+        owner: rabbitmq
+        group: rabbitmq
+        mode: "0644"
+        content: |
+          # RabbitMQ Enterprise Configuration
+          listeners.tcp.default = 5672
+          management.tcp.port = 15672
+          vm_memory_high_watermark.relative = {{ vm_memory_high_watermark }}
+          disk_free_limit.relative = 1.5
+          log.file.level = info
+      notify: Restart RabbitMQ
+
+    - name: Create Production Virtual Host
+      rabbitmq_vhost:
+        name: "{{ rabbitmq_vhost }}"
+        state: present
+
+    - name: Provision RabbitMQ Administrator User
+      rabbitmq_user:
+        user: "{{ rabbitmq_admin_user }}"
+        password: "{{ rabbitmq_admin_password }}"
+        tags:
+          - administrator
+        vhost: "/"
+        configure_priv: ".*"
+        read_priv: ".*"
+        write_priv: ".*"
+        state: present
+
+    - name: Provision Dedicated Application Worker User
+      rabbitmq_user:
+        user: "{{ rabbitmq_app_user }}"
+        password: "{{ rabbitmq_app_password }}"
+        tags:
+          - management
+        vhost: "{{ rabbitmq_vhost }}"
+        configure_priv: ".*"
+        read_priv: ".*"
+        write_priv: ".*"
+        state: present
+
+    - name: Delete Default Guest User for Security Hardening
+      rabbitmq_user:
+        user: guest
+        state: absent
+
+    - name: Configure UFW Rules for AMQP and Management Console
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "{{ rabbitmq_amqp_port }}"
+        - "{{ rabbitmq_management_port }}"
+      ignore_errors: yes
+
+  handlers:
+
+    - name: Restart RabbitMQ
+      service:
+        name: "{{ rabbitmq_service_name }}"
+        state: restarted
