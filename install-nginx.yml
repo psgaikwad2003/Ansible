@@ -1,23 +1,136 @@
 ---
-- name: Install Nginx
+- name: Production Nginx Web Server Installation & Hardening
   hosts: web
   become: yes
+  gather_facts: yes
+
+  vars:
+    nginx_port: 80
+    server_domain: "{{ ansible_fqdn | default('localhost') }}"
+    nginx_root: /var/www/html
+    client_max_body_size: "32M"
+    keepalive_timeout: 65
+    server_tokens: "off"
 
   tasks:
-
-    - name: Install Nginx
+    - name: Install Nginx HTTP server and dependencies
       apt:
-        name: nginx
+        name:
+          - nginx
+          - curl
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - install
+        - nginx
 
-- name: Start Nginx Service
-  hosts: web
-  become: yes
+    - name: Remove default Nginx virtual host configuration
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload Nginx
+      tags:
+        - config
 
-  tasks:
+    - name: Configure production Nginx virtual host
+      copy:
+        dest: "/etc/nginx/sites-available/production.conf"
+        content: |
+          server {
+              listen {{ nginx_port }} default_server;
+              listen [::]:{{ nginx_port }} default_server;
 
-    - name: Start Service
+              server_name {{ server_domain }};
+              root {{ nginx_root }};
+              index index.html index.htm;
+
+              server_tokens {{ server_tokens }};
+              client_max_body_size {{ client_max_body_size }};
+              keepalive_timeout {{ keepalive_timeout }};
+
+              # Security Headers
+              add_header X-Frame-Options "SAMEORIGIN" always;
+              add_header X-XSS-Protection "1; mode=block" always;
+              add_header X-Content-Type-Options "nosniff" always;
+              add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+              # Gzip Compression
+              gzip on;
+              gzip_vary on;
+              gzip_min_length 1024;
+              gzip_proxied expired no-cache no-store private auth;
+              gzip_types text/plain text/css text/xml text/javascript application/x-javascript application/xml application/json;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+
+              location /healthz {
+                  access_log off;
+                  return 200 "OK\n";
+                  add_header Content-Type text/plain;
+              }
+
+              error_page 404 /404.html;
+              error_page 500 502 503 504 /50x.html;
+          }
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload Nginx
+      tags:
+        - config
+
+    - name: Enable production virtual host site
+      file:
+        src: /etc/nginx/sites-available/production.conf
+        dest: /etc/nginx/sites-enabled/production.conf
+        state: link
+      notify: Reload Nginx
+      tags:
+        - config
+
+    - name: Validate Nginx configuration syntax
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+      tags:
+        - config
+        - verify
+
+    - name: Ensure Nginx service is running and enabled on boot
       service:
         name: nginx
         state: started
+        enabled: yes
+      tags:
+        - service
+
+    - name: Verify HTTP health endpoint response
+      uri:
+        url: "http://127.0.0.1:{{ nginx_port }}/healthz"
+        return_content: yes
+        status_code: 200
+      register: health_check
+      retries: 3
+      delay: 2
+      tags:
+        - verify
+
+    - name: Display Nginx deployment status
+      debug:
+        msg: "Nginx web server is operational on port {{ nginx_port }}. Healthcheck response: '{{ health_check.content | trim }}'."
+      tags:
+        - verify
+
+  handlers:
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
