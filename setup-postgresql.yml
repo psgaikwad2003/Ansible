@@ -85,3 +85,10 @@
       service:
         name: postgresql
         state: restarted
+
+    - name: Display PostgreSQL Deployment Status
+      debug:
+        msg: "PostgreSQL 16 server is installed and configured. Database '{{ db_name }}' and user '{{ db_user }}' are ready." 
+    
+    - name: Flush handlers to ensure PostgreSQL configuration is active
+      meta: flush_handlers 
