@@ -1,11 +1,151 @@
 ---
-- name: Copy HTML File
+- name: Production Static Web Asset & Site Deployment
   hosts: web
   become: yes
+  gather_facts: yes
+
+  vars:
+    web_root_dir: /var/www/html
+    web_user: www-data
+    web_group: www-data
+    site_title: "Cloud Infrastructure Production Portal"
+    site_environment: "Production"
+    release_version: "v1.4.0"
+    enable_backup: yes
 
   tasks:
+    - name: Ensure web document root directory exists
+      file:
+        path: "{{ web_root_dir }}"
+        state: directory
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0755"
+      tags:
+        - web
+        - setup
 
-    - name: Copy index.html
+    - name: Deploy production index.html landing page
       copy:
-        src: index.html
-        dest: /var/www/html/index.html
+        dest: "{{ web_root_dir }}/index.html"
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>{{ site_title }}</title>
+              <style>
+                  :root {
+                      --bg: #0f172a;
+                      --card: #1e293b;
+                      --text: #f8fafc;
+                      --accent: #38bdf8;
+                      --border: #334155;
+                  }
+                  body {
+                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                      background-color: var(--bg);
+                      color: var(--text);
+                      display: flex;
+                      justify-content: center;
+                      align-items: center;
+                      min-height: 100vh;
+                      margin: 0;
+                  }
+                  .card {
+                      background: var(--card);
+                      border: 1px solid var(--border);
+                      border-radius: 12px;
+                      padding: 2.5rem;
+                      max-width: 600px;
+                      width: 90%;
+                      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+                  }
+                  h1 { color: var(--accent); margin-top: 0; }
+                  .badge {
+                      display: inline-block;
+                      padding: 0.25rem 0.75rem;
+                      background: #0284c7;
+                      color: white;
+                      border-radius: 9999px;
+                      font-size: 0.85rem;
+                      font-weight: 600;
+                  }
+                  .meta { margin-top: 1.5rem; border-top: 1px solid var(--border); padding-top: 1rem; font-size: 0.9rem; color: #94a3b8; }
+              </style>
+          </head>
+          <body>
+              <div class="card">
+                  <span class="badge">{{ site_environment }}</span>
+                  <h1>{{ site_title }}</h1>
+                  <p>Production cluster node provisioned and maintained via automated Ansible orchestration.</p>
+                  <div class="meta">
+                      <p><strong>Host:</strong> {{ ansible_hostname }} ({{ ansible_default_ipv4.address | default('localhost') }})</p>
+                      <p><strong>Release:</strong> {{ release_version }}</p>
+                      <p><strong>Last Deployed:</strong> {{ ansible_date_time.iso8601 }}</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0644"
+        backup: "{{ enable_backup }}"
+      notify: Reload Web Server
+      tags:
+        - web
+        - deploy
+
+    - name: Deploy custom 404 error page
+      copy:
+        dest: "{{ web_root_dir }}/404.html"
+        content: |
+          <!DOCTYPE html>
+          <html><head><title>404 Not Found</title></head>
+          <body style="font-family:sans-serif;text-align:center;padding:50px;">
+          <h1>404 - Page Not Found</h1>
+          <p>The requested resource could not be located on this server.</p>
+          </body></html>
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0644"
+      tags:
+        - web
+
+    - name: Deploy search engine robots.txt
+      copy:
+        dest: "{{ web_root_dir }}/robots.txt"
+        content: |
+          User-agent: *
+          Disallow: /admin/
+          Disallow: /private/
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0644"
+      tags:
+        - web
+
+    - name: Verify static asset deployment and calculate checksum
+      stat:
+        path: "{{ web_root_dir }}/index.html"
+        get_checksum: yes
+      register: index_stat
+      tags:
+        - verify
+
+    - name: Display asset deployment status
+      debug:
+        msg: "Asset index.html deployed successfully. SHA1: {{ index_stat.stat.checksum }}, Size: {{ index_stat.stat.size }} bytes."
+      tags:
+        - verify
+
+  handlers:
+    - name: Reload Web Server
+      service:
+        name: "{{ item }}"
+        state: reloaded
+      loop:
+        - nginx
+        - apache2
+      failed_when: false
