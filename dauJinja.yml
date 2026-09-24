@@ -1,22 +1,119 @@
 ---
-- name:Configuration application
+- name: Dynamic Application Configuration & Jinja2 Template Orchestration
   hosts: app
   become: yes
+  gather_facts: yes
 
   vars:
+    app_name: myapp
+    app_environment: production
     app_port: 8080
-    db_host: 10.0.0.0
+    app_host: "0.0.0.0"
+    app_workers: 4
+    log_level: "INFO"
+    config_dir: "/etc/myapp"
+
+    # Database Configuration Object
+    database:
+      host: "10.0.0.10"
+      port: 5432
+      name: "myapp_prod"
+      max_connections: 50
+      connection_timeout_sec: 30
+
+    # Cache Configuration
+    cache:
+      enabled: true
+      backend: "redis"
+      redis_host: "10.0.0.20"
+      redis_port: 6379
+      ttl_seconds: 3600
+
+    # Dynamic Feature Toggles
+    feature_flags:
+      - name: "enable_new_auth_flow"
+        enabled: true
+      - name: "maintenance_mode"
+        enabled: false
+      - name: "metrics_collection"
+        enabled: true
 
   tasks:
-    - name: Deploy configuration
-      template:
-        src: app.conf.j2
-        dest: /etc/myapp/app.conf
+    - name: Ensure application configuration directory exists
+      file:
+        path: "{{ config_dir }}"
+        state: directory
         owner: root
         group: root
+        mode: "0750"
+      tags:
+        - config
+        - setup
+
+    - name: Render dynamic application configuration from Jinja2 template
+      copy:
+        dest: "{{ config_dir }}/app.conf"
+        content: |
+          # =======================================================
+          # ANSIBLE MANAGED APPLICATION CONFIGURATION
+          # Node: {{ ansible_hostname }} | Generated: {{ ansible_date_time.iso8601 }}
+          # Environment: {{ app_environment | upper }}
+          # =======================================================
+
+          [server]
+          bind_host = {{ app_host }}
+          port = {{ app_port }}
+          workers = {{ app_workers }}
+          environment = {{ app_environment }}
+          log_level = {{ log_level }}
+
+          [database]
+          host = {{ database.host }}
+          port = {{ database.port }}
+          database_name = {{ database.name }}
+          max_connections = {{ database.max_connections }}
+          connection_timeout = {{ database.connection_timeout_sec }}
+
+          [cache]
+          enabled = {{ 'true' if cache.enabled else 'false' }}
+          backend = {{ cache.backend }}
+          redis_endpoint = {{ cache.redis_host }}:{{ cache.redis_port }}
+          cache_ttl = {{ cache.ttl_seconds }}
+
+          [features]
+          {% for feature in feature_flags %}
+          feature_{{ feature.name }} = {{ 'true' if feature.enabled else 'false' }}
+          {% endfor %}
+        owner: root
+        group: root
+        mode: "0640"
+        backup: yes
+      notify: Restart Application Service
+      tags:
+        - config
+        - template
+
+    - name: Validate rendered configuration file integrity
+      stat:
+        path: "{{ config_dir }}/app.conf"
+        get_checksum: yes
+      register: conf_stat
+      failed_when: not conf_stat.stat.exists
+      tags:
+        - verify
+
+    - name: Display Configuration Rendering Status
+      debug:
+        msg:
+          - "Application config deployed to: {{ config_dir }}/app.conf"
+          - "File size: {{ conf_stat.stat.size }} bytes | SHA1: {{ conf_stat.stat.checksum }}"
+          - "Active features: {{ feature_flags | selectattr('enabled') | map(attribute='name') | list }}"
+      tags:
+        - verify
 
   handlers:
-    - name: Restart application
+    - name: Restart Application Service
       service:
-        name: myapp
+        name: "{{ app_name }}"
         state: restarted
+      failed_when: false
