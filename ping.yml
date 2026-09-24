@@ -1,9 +1,52 @@
 ---
-- name: Check Connection
+- name: Infrastructure Connectivity & System Health Audit
   hosts: all
   become: yes
+  gather_facts: yes
+
+  vars:
+    network_check_target: "8.8.8.8"
+    ping_timeout_seconds: 5
 
   tasks:
-
-    - name: Ping all servers
+    - name: Test Ansible management connectivity
       ping:
+        data: pong
+      register: ping_result
+      tags:
+        - connectivity
+        - ping
+
+    - name: Check outbound internet reachability
+      command: "ping -c 2 -W {{ ping_timeout_seconds }} {{ network_check_target }}"
+      register: outbound_ping
+      changed_when: false
+      failed_when: false
+      tags:
+        - network
+
+    - name: Gather current system uptime
+      command: uptime -p
+      register: system_uptime
+      changed_when: false
+      tags:
+        - facts
+        - health
+
+    - name: Display Host Diagnostic Summary
+      debug:
+        msg:
+          - "================ HOST HEALTH AUDIT ================"
+          - "Hostname       : {{ ansible_hostname }} ({{ ansible_fqdn }})"
+          - "OS Distribution: {{ ansible_distribution }} {{ ansible_distribution_version }} ({{ ansible_distribution_release }})"
+          - "Kernel Version : {{ ansible_kernel }} ({{ ansible_architecture }})"
+          - "CPU Cores      : {{ ansible_processor_vcpus }} vCPU(s)"
+          - "Total Memory   : {{ (ansible_memtotal_mb / 1024) | round(2) }} GB (Free: {{ (ansible_memfree_mb / 1024) | round(2) }} GB)"
+          - "Default IPv4   : {{ ansible_default_ipv4.address | default('N/A') }}"
+          - "System Uptime  : {{ system_uptime.stdout | default('N/A') }}"
+          - "Outbound Ping  : {{ 'SUCCESS' if outbound_ping.rc == 0 else 'FAILED' }} (Target: {{ network_check_target }})"
+          - "Ansible Ping   : {{ ping_result.ping }}"
+          - "==================================================="
+      tags:
+        - report
+        - diagnostics
