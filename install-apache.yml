@@ -1,18 +1,145 @@
 ---
-- name: Install Apache
+- name: Enterprise Apache HTTP Web Server Deployment & Security Hardening
   hosts: web
   become: yes
+  gather_facts: yes
+
+  vars:
+    apache_port: 80
+    apache_server_admin: "webmaster@example.com"
+    apache_doc_root: /var/www/html
+    apache_modules:
+      - rewrite
+      - headers
+      - ssl
+      - deflate
+      - status
 
   tasks:
-
-    - name: Install Apache
+    - name: Install Apache web server and utilities
       apt:
-        name: apache2
+        name:
+          - apache2
+          - apache2-utils
+          - curl
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - install
+        - apache
 
-    - name: Start Apache
+    - name: Enable required Apache modules
+      command: "a2enmod {{ item }}"
+      loop: "{{ apache_modules }}"
+      register: a2enmod_res
+      changed_when: "'Enabling module' in a2enmod_res.stdout"
+      notify: Restart Apache
+      tags:
+        - modules
+
+    - name: Configure Apache server information disclosure hardening
+      copy:
+        dest: /etc/apache2/conf-available/security-hardening.conf
+        content: |
+          # Security Hardening Directives
+          ServerTokens Prod
+          ServerSignature Off
+          TraceEnable Off
+          FileETag None
+
+          # Global Clickjacking and Content-Type Protection
+          <IfModule mod_headers.c>
+              Header always set X-Frame-Options "SAMEORIGIN"
+              Header always set X-Content-Type-Options "nosniff"
+              Header always set X-XSS-Protection "1; mode=block"
+          </IfModule>
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload Apache
+      tags:
+        - security
+        - config
+
+    - name: Enable security hardening configuration
+      command: a2enconf security-hardening
+      register: a2enconf_res
+      changed_when: "'Enabling conf' in a2enconf_res.stdout"
+      notify: Reload Apache
+      tags:
+        - security
+        - config
+
+    - name: Deploy custom Apache VirtualHost configuration
+      copy:
+        dest: /etc/apache2/sites-available/000-default.conf
+        content: |
+          <VirtualHost *:{{ apache_port }}>
+              ServerAdmin {{ apache_server_admin }}
+              DocumentRoot {{ apache_doc_root }}
+
+              <Directory {{ apache_doc_root }}>
+                  Options -Indexes +FollowSymLinks
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+
+              # Compression settings
+              <IfModule mod_deflate.c>
+                  AddOutputFilterByType DEFLATE text/html text/plain text/xml text/css text/javascript application/javascript application/json
+              </IfModule>
+
+              ErrorLog ${APACHE_LOG_DIR}/error.log
+              CustomLog ${APACHE_LOG_DIR}/access.log combined
+          </VirtualHost>
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload Apache
+      tags:
+        - config
+
+    - name: Validate Apache configuration syntax
+      command: apache2ctl configtest
+      register: apache_config_test
+      changed_when: false
+      tags:
+        - config
+        - verify
+
+    - name: Ensure Apache service is started and enabled on boot
       service:
         name: apache2
         state: started
         enabled: yes
+      tags:
+        - service
+
+    - name: Verify Apache HTTP listener status
+      uri:
+        url: "http://127.0.0.1:{{ apache_port }}/"
+        status_code: [200, 403, 304]
+        timeout: 5
+      register: http_response
+      retries: 3
+      delay: 2
+      tags:
+        - verify
+
+    - name: Display Apache Deployment Summary
+      debug:
+        msg: "Apache HTTP Server is active and listening on port {{ apache_port }}. Status code: {{ http_response.status }}."
+      tags:
+        - verify
+
+  handlers:
+    - name: Reload Apache
+      service:
+        name: apache2
+        state: reloaded
+
+    - name: Restart Apache
+      service:
+        name: apache2
+        state: restarted
