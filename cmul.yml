@@ -1,33 +1,113 @@
 ---
-- name: Create multiple users
+- name: Multi-User Onboarding, Team Provisioning & Access Hardening
   hosts: all
   become: yes
+  gather_facts: yes
 
   vars:
-    users:
-      - dev1
-      - dev2
-      - dev3
+    primary_team_group: developers
+    primary_team_gid: 2000
+    team_members:
+      - name: dev1
+        uid: 2001
+        role: "Frontend Engineer"
+        shell: /bin/bash
+        groups: ["developers"]
+        sudo_access: false
+      - name: dev2
+        uid: 2002
+        role: "Backend Engineer"
+        shell: /bin/bash
+        groups: ["developers"]
+        sudo_access: false
+      - name: dev3
+        uid: 2003
+        role: "DevOps Engineer"
+        shell: /bin/bash
+        groups: ["developers", "sudo"]
+        sudo_access: true
 
   tasks:
-    - name: Create group
+    - name: Ensure primary team group exists
       group:
-        name: developers
+        name: "{{ primary_team_group }}"
+        gid: "{{ primary_team_gid }}"
         state: present
+      tags:
+        - groups
 
-    - name: Create users
+    - name: Provision team member user accounts
       user:
-        name: "{{ item }}"
-        group: developers
-        shell: /bin/bash
+        name: "{{ item.name }}"
+        uid: "{{ item.uid }}"
+        group: "{{ primary_team_group }}"
+        groups: "{{ item.groups }}"
+        append: yes
+        shell: "{{ item.shell }}"
+        comment: "{{ item.role }}"
         create_home: yes
-      loop: "{{ users }}"
+        state: present
+      loop: "{{ team_members }}"
+      loop_control:
+        label: "{{ item.name }} (UID: {{ item.uid }})"
+      tags:
+        - users
 
-    - name: Create SSH directory
+    - name: Create secured SSH directory for each user
       file:
-        path: "/home/{{ item }}/.ssh"
+        path: "/home/{{ item.name }}/.ssh"
         state: directory
-        owner: "{{ item }}"
-        group: developers
+        owner: "{{ item.name }}"
+        group: "{{ primary_team_group }}"
         mode: "0700"
-      loop: "{{ users }}"
+      loop: "{{ team_members }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags:
+        - ssh
+        - security
+
+    - name: Deploy secure umask profile in user bashrc
+      blockinfile:
+        path: "/home/{{ item.name }}/.bashrc"
+        marker: "# {mark} ANSIBLE MANAGED SECURITY UMASK"
+        block: |
+          umask 027
+          HISTCONTROL=ignoredups:erasedups
+          HISTSIZE=5000
+      loop: "{{ team_members }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags:
+        - environment
+
+    - name: Configure scoped sudoers privileges for designated team leads
+      copy:
+        dest: "/etc/sudoers.d/99-team-{{ item.name }}"
+        content: "{{ item.name }} ALL=(ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+      loop: "{{ team_members }}"
+      when: item.sudo_access | default(false)
+      loop_control:
+        label: "{{ item.name }}"
+      tags:
+        - sudo
+        - security
+
+    - name: Verify user provisioning status in /etc/passwd
+      getent:
+        database: passwd
+      tags:
+        - verify
+
+    - name: Display Team Provisioning Audit Summary
+      debug:
+        msg: "Provisioned {{ item.name }} (Role: {{ item.role }}, Home: {{ ansible_facts.getent_passwd[item.name][4] }}, Shell: {{ ansible_facts.getent_passwd[item.name][5] }})."
+      loop: "{{ team_members }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags:
+        - verify
