@@ -1,11 +1,101 @@
 ---
-- name: Create User
+- name: Enterprise User Provisioning & Sudo Security Hardening
   hosts: all
   become: yes
+  gather_facts: yes
+
+  vars:
+    admin_user: devops
+    admin_group: devops
+    admin_uid: 1050
+    admin_gid: 1050
+    admin_shell: /bin/bash
+    admin_comment: "DevOps Infrastructure Administrator"
+    additional_groups:
+      - sudo
+      - adm
+    sudo_nopasswd: true
+    # Provide public key string or comment placeholder
+    ssh_public_key: ""
 
   tasks:
-
-    - name: Create User
-      user:
-        name: devops
+    - name: Ensure primary group exists
+      group:
+        name: "{{ admin_group }}"
+        gid: "{{ admin_gid }}"
         state: present
+      tags:
+        - user
+        - group
+
+    - name: Provision admin user account
+      user:
+        name: "{{ admin_user }}"
+        group: "{{ admin_group }}"
+        groups: "{{ additional_groups }}"
+        append: yes
+        uid: "{{ admin_uid }}"
+        shell: "{{ admin_shell }}"
+        comment: "{{ admin_comment }}"
+        create_home: yes
+        state: present
+      tags:
+        - user
+
+    - name: Create secure .ssh directory for admin user
+      file:
+        path: "/home/{{ admin_user }}/.ssh"
+        state: directory
+        owner: "{{ admin_user }}"
+        group: "{{ admin_group }}"
+        mode: "0700"
+      tags:
+        - ssh
+        - security
+
+    - name: Deploy authorized SSH key if provided
+      authorized_key:
+        user: "{{ admin_user }}"
+        state: present
+        key: "{{ ssh_public_key }}"
+      when: ssh_public_key | length > 0
+      tags:
+        - ssh
+
+    - name: Configure passwordless sudo privileges in sudoers.d
+      copy:
+        dest: "/etc/sudoers.d/90-{{ admin_user }}"
+        content: "{{ admin_user }} ALL=(ALL) {{ 'NOPASSWD:' if sudo_nopasswd else '' }}ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+      tags:
+        - sudo
+        - security
+
+    - name: Deploy developer shell environment aliases
+      blockinfile:
+        path: "/home/{{ admin_user }}/.bashrc"
+        marker: "# {mark} ANSIBLE MANAGED DEVOPS ALIASES"
+        block: |
+          alias ll='ls -alF --color=auto'
+          alias gs='git status'
+          alias dps='docker ps --format "table {{'{{'}}.Names{{'}}'}}\t{{'{{'}}.Status{{'}}'}}\t{{'{{'}}.Ports{{'}}'}}"'
+          export EDITOR=vim
+      tags:
+        - environment
+
+    - name: Verify user account creation
+      getent:
+        database: passwd
+        key: "{{ admin_user }}"
+      register: user_info
+      tags:
+        - verify
+
+    - name: Output user configuration status
+      debug:
+        msg: "User '{{ admin_user }}' successfully provisioned with UID {{ user_info.ansible_facts.getent_passwd[admin_user][1] }} and shell {{ user_info.ansible_facts.getent_passwd[admin_user][5] }}."
+      tags:
+        - verify
