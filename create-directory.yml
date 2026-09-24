@@ -1,12 +1,77 @@
 ---
-- name: Create Directory
+- name: Multi-Tier Project Directory & Storage Hierarchy Provisioning
   hosts: all
   become: yes
+  gather_facts: yes
+
+  vars:
+    project_base_dir: /opt/project
+    service_user: root
+    service_group: root
+    project_subdirs:
+      - { path: "bin", mode: "0750" }
+      - { path: "config", mode: "0750" }
+      - { path: "data", mode: "0755" }
+      - { path: "logs", mode: "0775" }
+      - { path: "backups", mode: "0700" }
+      - { path: "tmp", mode: "1777" }  # Sticky bit for shared temporary files
 
   tasks:
-
-    - name: Create Project Folder
+    - name: Ensure root project directory exists
       file:
-        path: /opt/project
+        path: "{{ project_base_dir }}"
         state: directory
-        mode: '0755'
+        owner: "{{ service_user }}"
+        group: "{{ service_group }}"
+        mode: "0755"
+      tags:
+        - filesystem
+        - directories
+
+    - name: Create structured application subdirectories
+      file:
+        path: "{{ project_base_dir }}/{{ item.path }}"
+        state: directory
+        owner: "{{ service_user }}"
+        group: "{{ service_group }}"
+        mode: "{{ item.mode }}"
+      loop: "{{ project_subdirs }}"
+      tags:
+        - filesystem
+        - directories
+
+    - name: Deploy directory manifest and usage documentation
+      copy:
+        dest: "{{ project_base_dir }}/README.md"
+        content: |
+          # Project Storage Hierarchy
+          - `bin/`: Executables, operational scripts, and helper binaries
+          - `config/`: Application configuration files and secrets
+          - `data/`: Persistent storage and application state
+          - `logs/`: Application and system event logs
+          - `backups/`: Local snapshot archives and recovery checkpoints
+          - `tmp/`: Ephemeral staging and temporary processing files
+
+          Managed by Ansible on {{ ansible_date_time.iso8601 }}.
+        owner: "{{ service_user }}"
+        group: "{{ service_group }}"
+        mode: "0644"
+      tags:
+        - documentation
+
+    - name: Audit directory creation status
+      stat:
+        path: "{{ project_base_dir }}/{{ item.path }}"
+      loop: "{{ project_subdirs }}"
+      register: dir_stats
+      tags:
+        - verify
+
+    - name: Display Directory Provisioning Summary
+      debug:
+        msg: "Directory '{{ item.item.path }}' is present with mode {{ item.stat.mode }} owned by {{ item.stat.pw_name }}:{{ item.stat.gr_name }}."
+      loop: "{{ dir_stats.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      tags:
+        - verify
