@@ -1,29 +1,125 @@
 ---
-- name: Deploy Docker Application
+- name: Production Docker Engine Setup & Container Application Deployment
   hosts: docker
   become: yes
+  gather_facts: yes
+
+  vars:
+    docker_packages:
+      - docker.io
+      - docker-compose-plugin
+      - python3-docker
+      - curl
+    app_container_name: "web-portal"
+    app_image_name: "nginx"
+    app_image_tag: "alpine"
+    app_host_port: 8080
+    app_container_port: 80
+    app_network_name: "app-tier-net"
+    container_memory_limit: "512m"
+    container_restart_policy: "unless-stopped"
 
   tasks:
-
-    - name: Install Docker
+    - name: Install Docker Engine and Python Docker SDK
       apt:
-        name: docker.io
+        name: "{{ docker_packages }}"
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - docker
+        - install
 
-    - name: Start Docker Service
+    - name: Configure Docker daemon optimization and log rotation
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "live-restore": true
+          }
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart Docker
+      tags:
+        - docker
+        - config
+
+    - name: Ensure Docker daemon is started and enabled on boot
       service:
         name: docker
         state: started
         enabled: yes
+      tags:
+        - docker
+        - service
 
-    - name: Pull Docker Image
-      command: docker pull nginx:latest
+    - name: Flush handlers to ensure Docker daemon configuration is active
+      meta: flush_handlers
 
-    - name: Run Docker Container
+    - name: Create dedicated Docker bridge network
+      command: "docker network create --driver bridge {{ app_network_name }}"
+      register: network_create
+      failed_when: false
+      changed_when: network_create.rc == 0
+      tags:
+        - docker
+        - network
+
+    - name: Pull application Docker image
+      command: "docker pull {{ app_image_name }}:{{ app_image_tag }}"
+      register: pull_res
+      changed_when: "'Downloaded newer image' in pull_res.stdout or 'Pull complete' in pull_res.stdout"
+      tags:
+        - docker
+        - image
+
+    - name: Check if existing container is present
+      command: "docker ps -a --filter name=^{{ app_container_name }}$ --format '{% raw %}{{.ID}}{% endraw %}'"
+      register: existing_container
+      changed_when: false
+      tags:
+        - deploy
+
+    - name: Stop and remove outdated container if already existing
+      command: "docker rm -f {{ app_container_name }}"
+      when: existing_container.stdout != ""
+      tags:
+        - deploy
+
+    - name: Run application container with production controls
       command: >
         docker run -d
-        --name nginx-container
-        -p 80:80
-        nginx:latest
-      ignore_errors: yes
+        --name {{ app_container_name }}
+        --network {{ app_network_name }}
+        --restart {{ container_restart_policy }}
+        --memory {{ container_memory_limit }}
+        -p {{ app_host_port }}:{{ app_container_port }}
+        {{ app_image_name }}:{{ app_image_tag }}
+      tags:
+        - deploy
+
+    - name: Verify application container running state
+      command: "docker inspect --format '{% raw %}{{.State.Status}}{% endraw %}' {{ app_container_name }}"
+      register: container_status
+      failed_when: container_status.stdout != "running"
+      changed_when: false
+      tags:
+        - verify
+
+    - name: Display Application Container Status
+      debug:
+        msg: "Container '{{ app_container_name }}' (Image: {{ app_image_name }}:{{ app_image_tag }}) is {{ container_status.stdout }} on port {{ app_host_port }}."
+      tags:
+        - verify
+
+  handlers:
+    - name: Restart Docker
+      service:
+        name: docker
+        state: restarted
