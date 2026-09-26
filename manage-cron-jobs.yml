@@ -1,60 +1,224 @@
 ---
-- name: Manage Scheduled Cron Jobs
+- name: Enterprise Cron Scheduling, Automated Maintenance Scripts & Logrotate Lifecycle Management
   hosts: all
   become: yes
+  gather_facts: yes
 
   vars:
+    cron_scripts_dir: "/usr/local/bin/cron-tasks"
+    cron_log_dir: "/var/log/cron-tasks"
+    backup_dir: "/opt/backups"
+    backup_retention_days: 14
     log_retention_days: 30
-    backup_dir: /opt/backups
+    disk_threshold_pct: 85
+    admin_email: "ops-alerts@example.com"
 
   tasks:
+    - name: Ensure cron package and logrotate are installed
+      apt:
+        name:
+          - cron
+          - logrotate
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - packages
 
-    - name: Create Backup Directory
+    - name: Ensure cron service is enabled and started
+      service:
+        name: cron
+        state: started
+        enabled: yes
+      tags:
+        - service
+
+    - name: Create maintenance directories and log storage
       file:
-        path: "{{ backup_dir }}"
+        path: "{{ item.path }}"
         state: directory
         owner: root
         group: root
-        mode: "0755"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ cron_scripts_dir }}", mode: "0750" }
+        - { path: "{{ cron_log_dir }}", mode: "0750" }
+        - { path: "{{ backup_dir }}", mode: "0700" }
+      tags:
+        - directories
 
-    - name: Schedule Daily Log Cleanup
+    - name: Deploy automated system configuration backup script
+      copy:
+        dest: "{{ cron_scripts_dir }}/system-backup.sh"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
+          BACKUP_FILE="{{ backup_dir }}/system_backup_${TIMESTAMP}.tar.gz"
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Starting automated system backup..."
+          tar -czf "${BACKUP_FILE}" \
+              --exclude='/etc/shadow*' \
+              --exclude='/etc/gshadow*' \
+              /etc /opt 2>/dev/null || true
+
+          chmod 600 "${BACKUP_FILE}"
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Backup created at ${BACKUP_FILE}"
+
+          # Prune backups older than retention window
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Pruning backups older than {{ backup_retention_days }} days..."
+          find "{{ backup_dir }}" -name "system_backup_*.tar.gz" -type f -mtime +{{ backup_retention_days }} -delete
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Backup maintenance complete."
+        owner: root
+        group: root
+        mode: "0750"
+      tags:
+        - scripts
+
+    - name: Deploy automated log cleanup script
+      copy:
+        dest: "{{ cron_scripts_dir }}/log-cleaner.sh"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Initiating stale log cleanup older than {{ log_retention_days }} days..."
+          find /var/log -type f \( -name "*.gz" -o -name "*.1" -o -name "*.old" \) -mtime +{{ log_retention_days }} -print -delete
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Log cleanup complete."
+        owner: root
+        group: root
+        mode: "0750"
+      tags:
+        - scripts
+
+    - name: Deploy disk utilization monitoring script
+      copy:
+        dest: "{{ cron_scripts_dir }}/disk-monitor.sh"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          THRESHOLD={{ disk_threshold_pct }}
+          CURRENT_USAGE=$(df -h / | awk 'NR==2 {print $5}' | tr -d '%')
+
+          if [ "${CURRENT_USAGE}" -ge "${THRESHOLD}" ]; then
+              MSG="CRITICAL: Root filesystem usage is at ${CURRENT_USAGE}% (Threshold: ${THRESHOLD}%) on $(hostname)"
+              echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${MSG}"
+              logger -t disk-monitor -p user.crit "${MSG}"
+          else
+              echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Disk usage is normal at ${CURRENT_USAGE}%."
+          fi
+        owner: root
+        group: root
+        mode: "0750"
+      tags:
+        - scripts
+
+    - name: Deploy temporary directory cleanup script
+      copy:
+        dest: "{{ cron_scripts_dir }}/temp-cleaner.sh"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleaning unreferenced files in /tmp older than 7 days..."
+          find /tmp -mindepth 1 -depth -type f -atime +7 -not -name ".*" -delete 2>/dev/null || true
+          find /var/tmp -mindepth 1 -depth -type f -atime +7 -not -name ".*" -delete 2>/dev/null || true
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Temp cleanup complete."
+        owner: root
+        group: root
+        mode: "0750"
+      tags:
+        - scripts
+
+    - name: Configure crontab environment variables
       cron:
-        name: "Daily log cleanup"
-        minute: "0"
-        hour: "2"
-        job: "find /var/log -name '*.log' -mtime +{{ log_retention_days }} -delete"
+        name: "{{ item.name }}"
+        env: yes
+        job: "{{ item.value }}"
         user: root
+      loop:
+        - { name: "PATH", value: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+        - { name: "SHELL", value: "/bin/bash" }
+        - { name: "MAILTO", value: "{{ admin_email }}" }
+      tags:
+        - cron
+        - env
 
-    - name: Schedule Weekly System Backup
+    - name: Schedule Weekly System Backup Cron Job
       cron:
-        name: "Weekly system backup"
+        name: "Enterprise Weekly System Backup"
         minute: "0"
         hour: "3"
         weekday: "0"
-        job: "tar -czf {{ backup_dir }}/system_backup_$(date +\\%F).tar.gz /etc /opt"
+        job: "{{ cron_scripts_dir }}/system-backup.sh >> {{ cron_log_dir }}/system-backup.log 2>&1"
         user: root
+      tags:
+        - cron
 
-    - name: Schedule Hourly Disk Space Alert
+    - name: Schedule Daily Log Cleanup Cron Job
       cron:
-        name: "Hourly disk space check"
+        name: "Enterprise Daily Log Maintenance"
+        minute: "15"
+        hour: "2"
+        job: "{{ cron_scripts_dir }}/log-cleaner.sh >> {{ cron_log_dir }}/log-cleaner.log 2>&1"
+        user: root
+      tags:
+        - cron
+
+    - name: Schedule Hourly Disk Space Monitoring Cron Job
+      cron:
+        name: "Enterprise Hourly Disk Space Watcher"
         minute: "0"
         hour: "*"
-        job: "df -h / | awk 'NR==2{if($5+0 > 85) print \"ALERT: Disk usage at \"$5}' >> /var/log/disk_alerts.log"
+        job: "{{ cron_scripts_dir }}/disk-monitor.sh >> {{ cron_log_dir }}/disk-monitor.log 2>&1"
         user: root
+      tags:
+        - cron
 
-    - name: Remove Old Temp Files Every Night
+    - name: Schedule Nightly Temporary Directory Cleanup Cron Job
       cron:
-        name: "Nightly temp cleanup"
-        minute: "30"
+        name: "Enterprise Nightly Temp Pruning"
+        minute: "45"
         hour: "1"
-        job: "find /tmp -type f -atime +7 -delete"
+        job: "{{ cron_scripts_dir }}/temp-cleaner.sh >> {{ cron_log_dir }}/temp-cleaner.log 2>&1"
         user: root
+      tags:
+        - cron
 
-    - name: List All Cron Jobs for Root
+    - name: Deploy logrotate configuration for cron task outputs
+      copy:
+        dest: /etc/logrotate.d/cron-tasks
+        content: |
+          {{ cron_log_dir }}/*.log {
+              weekly
+              missingok
+              rotate 4
+              compress
+              delaycompress
+              notifempty
+              create 0640 root root
+          }
+        owner: root
+        group: root
+        mode: "0644"
+      tags:
+        - logrotate
+
+    - name: Audit active crontab configuration for root
       command: crontab -l
-      register: cron_list
+      register: cron_audit
       changed_when: false
+      tags:
+        - verify
 
-    - name: Display Current Cron Jobs
+    - name: Display Cron Automation Audit Summary
       debug:
-        msg: "{{ cron_list.stdout_lines }}"
+        msg:
+          - "Cron automation is configured and running."
+          - "Scripts Directory: {{ cron_scripts_dir }}"
+          - "Log Directory: {{ cron_log_dir }} (Managed via Logrotate)"
+          - "Active Crontab Lines: {{ cron_audit.stdout_lines | length }}"
+      tags:
+        - verify
