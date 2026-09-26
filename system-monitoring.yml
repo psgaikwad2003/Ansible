@@ -1,68 +1,198 @@
 ---
-- name: System Health Check and Monitoring
+- name: Enterprise System Health Diagnostics, Resource Telemetry & Health Audit Automation
   hosts: all
   become: yes
+  gather_facts: yes
+
+  vars:
+    disk_warning_threshold: 80
+    disk_critical_threshold: 90
+    memory_warning_threshold: 85
+    report_dir: "/var/log/system-audits"
+    report_retention_days: 14
 
   tasks:
-
-    - name: Gather System Facts
+    - name: Gather comprehensive hardware and network facts
       setup:
         gather_subset:
           - hardware
           - network
+          - virtual
+      tags:
+        - facts
 
-    - name: Display Hostname
-      debug:
-        msg: "Hostname: {{ ansible_hostname }}"
+    - name: Ensure system audit reports directory exists
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      tags:
+        - init
 
-    - name: Display OS Information
-      debug:
-        msg: "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+    - name: Collect 1, 5, and 15-minute system load averages
+      command: cat /proc/loadavg
+      register: loadavg_raw
+      changed_when: false
+      tags:
+        - metrics
+        - cpu
 
-    - name: Check Disk Usage
+    - name: Set parsed load average facts
+      set_fact:
+        load_1m: "{{ loadavg_raw.stdout.split()[0] }}"
+        load_5m: "{{ loadavg_raw.stdout.split()[1] }}"
+        load_15m: "{{ loadavg_raw.stdout.split()[2] }}"
+      tags:
+        - metrics
+        - cpu
+
+    - name: Calculate memory utilization percentage
+      set_fact:
+        mem_used_mb: "{{ ansible_memtotal_mb - ansible_memfree_mb }}"
+        mem_used_pct: "{{ (((ansible_memtotal_mb - ansible_memfree_mb) / ansible_memtotal_mb) * 100) | round(1) }}"
+      tags:
+        - metrics
+        - memory
+
+    - name: Check for failed systemd service units
+      command: systemctl --failed --no-legend
+      register: failed_services
+      changed_when: false
+      failed_when: false
+      tags:
+        - services
+
+    - name: Count total running processes and zombie processes
+      shell: |
+        echo "total=$(ps -ef | wc -l)"
+        echo "zombies=$(ps -eo stat | grep -c '^Z' || true)"
+      register: process_stats
+      changed_when: false
+      tags:
+        - processes
+
+    - name: Inspect root partition disk space usage
       command: df -h /
-      register: disk_usage
+      register: root_disk_raw
       changed_when: false
+      tags:
+        - metrics
+        - disk
 
-    - name: Show Disk Usage
-      debug:
-        msg: "{{ disk_usage.stdout_lines }}"
+    - name: Check whether system reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+      tags:
+        - status
 
-    - name: Check Memory Usage
-      command: free -m
-      register: memory_usage
+    - name: Test outbound Internet and DNS connectivity
+      command: ping -c 2 -W 3 1.1.1.1
+      register: net_ping
       changed_when: false
+      failed_when: false
+      tags:
+        - network
 
-    - name: Show Memory Usage
-      debug:
-        msg: "{{ memory_usage.stdout_lines }}"
-
-    - name: Check Running Services Count
-      shell: systemctl list-units --type=service --state=running | wc -l
-      register: service_count
-      changed_when: false
-
-    - name: Show Running Services Count
-      debug:
-        msg: "Running services: {{ service_count.stdout }}"
-
-    - name: Check System Uptime
-      command: uptime -p
-      register: uptime_result
-      changed_when: false
-
-    - name: Show Uptime
-      debug:
-        msg: "Uptime: {{ uptime_result.stdout }}"
-
-    - name: Save Report to File
+    - name: Generate structured JSON system telemetry log
       copy:
+        dest: "{{ report_dir }}/system_health_{{ ansible_date_time.date }}.json"
         content: |
-          === System Health Report ===
-          Host: {{ ansible_hostname }}
-          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
-          CPU Cores: {{ ansible_processor_cores }}
-          Total RAM: {{ ansible_memtotal_mb }} MB
-          Uptime: {{ uptime_result.stdout }}
-          ============================
-        dest: /tmp/system_health_report.txt
+          {
+            "timestamp": "{{ ansible_date_time.iso8601 }}",
+            "hostname": "{{ ansible_hostname }}",
+            "os_distribution": "{{ ansible_distribution }} {{ ansible_distribution_version }}",
+            "kernel_version": "{{ ansible_kernel }}",
+            "uptime_seconds": {{ ansible_uptime_seconds }},
+            "cpu_cores": {{ ansible_processor_vcpus | default(ansible_processor_cores) }},
+            "load_averages": {
+              "1m": {{ load_1m }},
+              "5m": {{ load_5m }},
+              "15m": {{ load_15m }}
+            },
+            "memory": {
+              "total_mb": {{ ansible_memtotal_mb }},
+              "free_mb": {{ ansible_memfree_mb }},
+              "used_mb": {{ mem_used_mb }},
+              "used_pct": {{ mem_used_pct }}
+            },
+            "services": {
+              "failed_count": {{ (failed_services.stdout_lines | length) if failed_services.stdout else 0 }}
+            },
+            "reboot_required": {{ reboot_flag.stat.exists | lower }},
+            "network_reachable": {{ (net_ping.rc == 0) | lower }}
+          }
+        owner: root
+        group: root
+        mode: "0640"
+      tags:
+        - report
+        - json
+
+    - name: Generate human-readable system health audit report
+      copy:
+        dest: "{{ report_dir }}/system_health_report.txt"
+        content: |
+          ================================================================================
+                                   SYSTEM HEALTH & AUDIT REPORT
+          ================================================================================
+          Report Generated   : {{ ansible_date_time.iso8601 }}
+          Target Host        : {{ ansible_fqdn }} ({{ ansible_default_ipv4.address | default('N/A') }})
+          Operating System   : {{ ansible_distribution }} {{ ansible_distribution_version }} ({{ ansible_architecture }})
+          Linux Kernel       : {{ ansible_kernel }}
+          System Uptime      : {{ (ansible_uptime_seconds / 3600) | round(2) }} hours
+          --------------------------------------------------------------------------------
+          CPU & WORKLOAD TELEMETRY
+          --------------------------------------------------------------------------------
+          Logical Cores      : {{ ansible_processor_vcpus | default(ansible_processor_cores) }}
+          Load Averages      : 1m: {{ load_1m }} | 5m: {{ load_5m }} | 15m: {{ load_15m }}
+          --------------------------------------------------------------------------------
+          MEMORY TELEMETRY
+          --------------------------------------------------------------------------------
+          Total Memory       : {{ ansible_memtotal_mb }} MB
+          Used Memory        : {{ mem_used_mb }} MB ({{ mem_used_pct }}%)
+          Free Memory        : {{ ansible_memfree_mb }} MB
+          Swap Total         : {{ ansible_swaptotal_mb | default(0) }} MB
+          Swap Free          : {{ ansible_swapfree_mb | default(0) }} MB
+          --------------------------------------------------------------------------------
+          STORAGE UTILIZATION
+          --------------------------------------------------------------------------------
+          {% for mount in ansible_mounts %}
+          Mountpoint: {{ mount.mount }} (Device: {{ mount.device }}, FSType: {{ mount.fstype }})
+            Total: {{ (mount.size_total / 1073741824) | round(2) }} GB | Free: {{ (mount.size_available / 1073741824) | round(2) }} GB | Used: {{ (((mount.size_total - mount.size_available) / mount.size_total) * 100) | round(1) }}%
+          {% endfor %}
+          --------------------------------------------------------------------------------
+          SERVICES & SYSTEM STATUS
+          --------------------------------------------------------------------------------
+          Failed Systemd Units: {{ failed_services.stdout_lines | length if failed_services.stdout else 0 }}
+          Reboot Required     : {{ 'YES' if reboot_flag.stat.exists else 'NO' }}
+          Internet Ping (1.1.1.1): {{ 'HEALTHY' if net_ping.rc == 0 else 'UNREACHABLE' }}
+          ================================================================================
+        owner: root
+        group: root
+        mode: "0644"
+      tags:
+        - report
+        - text
+
+    - name: Prune audit reports older than retention limit
+      command: find {{ report_dir }} -type f -mtime +{{ report_retention_days }} -delete
+      changed_when: false
+      tags:
+        - maintenance
+
+    - name: Display System Health Audit Dashboard
+      debug:
+        msg:
+          - "================= [ HEALTH AUDIT SUMMARY ] ================="
+          - "Host: {{ ansible_hostname }} | Kernel: {{ ansible_kernel }}"
+          - "Load (1m/5m/15m): {{ load_1m }} / {{ load_5m }} / {{ load_15m }}"
+          - "Memory Used: {{ mem_used_pct }}% ({{ mem_used_mb }} MB / {{ ansible_memtotal_mb }} MB)"
+          - "Failed Services: {{ failed_services.stdout_lines | length if failed_services.stdout else 'None' }}"
+          - "Reboot Required: {{ 'YES (Action Recommended)' if reboot_flag.stat.exists else 'NO' }}"
+          - "Audit Logs written to: {{ report_dir }}/"
+          - "==========================================================="
+      tags:
+        - verify
