@@ -1,45 +1,161 @@
 ---
-- name: Install and Configure MySQL
+- name: Enterprise MySQL Database Deployment, Security Hardening & Performance Optimization
   hosts: db
   become: yes
+  gather_facts: yes
 
   vars:
-    mysql_root_password: "SecurePass@123"
-    db_name: webapp_db
-    db_user: app_user
-    db_password: "AppUser@456"
+    mysql_port: 3306
+    mysql_bind_address: "127.0.0.1"
+    mysql_root_password: "{{ vault_mysql_root_password | default('SecureRootPass@2026!') }}"
+    db_name: "production_app_db"
+    db_user: "app_user"
+    db_password: "{{ vault_db_password | default('ProductionAppSecret@2026!') }}"
+    db_collation: "utf8mb4_unicode_ci"
+    db_encoding: "utf8mb4"
+    mysql_max_connections: 200
+    mysql_innodb_buffer_pool_size: "512M"
+    mysql_innodb_log_file_size: "128M"
+    mysql_slow_query_log: 1
+    mysql_long_query_time: 2
 
   tasks:
-
-    - name: Install MySQL Server
+    - name: Install MySQL server, client, and Python database bindings
       apt:
         name:
           - mysql-server
           - mysql-client
           - python3-mysqldb
+          - python3-pymysql
+          - ufw
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - install
+        - packages
 
-    - name: Start MySQL Service
+    - name: Ensure MySQL service is enabled and running
       service:
         name: mysql
         state: started
         enabled: yes
+      tags:
+        - service
 
-    - name: Set MySQL Root Password
+    - name: Deploy MySQL server performance and security configuration
+      copy:
+        dest: /etc/mysql/mysql.conf.d/99-enterprise-tuning.cnf
+        content: |
+          # Enterprise Performance Tuning & Hardening
+          [mysqld]
+          port = {{ mysql_port }}
+          bind-address = {{ mysql_bind_address }}
+          max_connections = {{ mysql_max_connections }}
+          
+          # Character Set & Collation (Full Unicode Support)
+          character-set-server = {{ db_encoding }}
+          collation-server = {{ db_collation }}
+          
+          # InnoDB Engine Tuning
+          default_storage_engine = InnoDB
+          innodb_buffer_pool_size = {{ mysql_innodb_buffer_pool_size }}
+          innodb_log_file_size = {{ mysql_innodb_log_file_size }}
+          innodb_file_per_table = 1
+          innodb_flush_log_at_trx_commit = 1
+          innodb_flush_method = O_DIRECT
+
+          # Connection & Timeout Security
+          interactive_timeout = 300
+          wait_timeout = 300
+          max_connect_errors = 100
+
+          # Logging & Audit
+          slow_query_log = {{ mysql_slow_query_log }}
+          slow_query_log_file = /var/log/mysql/mysql-slow.log
+          long_query_time = {{ mysql_long_query_time }}
+          log_error = /var/log/mysql/error.log
+        owner: root
+        group: mysql
+        mode: "0640"
+      notify: Restart MySQL
+      tags:
+        - config
+        - tuning
+
+    - name: Configure root client credentials in /root/.my.cnf for secure operations
+      copy:
+        dest: /root/.my.cnf
+        content: |
+          [client]
+          user=root
+          password={{ mysql_root_password }}
+          host=localhost
+        owner: root
+        group: root
+        mode: "0600"
+      tags:
+        - security
+        - auth
+
+    - name: Set MySQL root password and authentication plugin
       mysql_user:
         name: root
         password: "{{ mysql_root_password }}"
         login_unix_socket: /var/run/mysqld/mysqld.sock
+        host: localhost
+        state: present
+      tags:
+        - security
+        - auth
 
-    - name: Create Application Database
+    - name: Remove anonymous MySQL user accounts
+      mysql_user:
+        name: ""
+        host_all: yes
+        state: absent
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      tags:
+        - security
+
+    - name: Disallow remote root login
+      mysql_user:
+        name: root
+        host: "{{ item }}"
+        state: absent
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      loop:
+        - "{{ ansible_hostname }}"
+        - "127.0.0.1"
+        - "::1"
+      when: item != "localhost"
+      ignore_errors: yes
+      tags:
+        - security
+
+    - name: Remove default test database
+      mysql_db:
+        name: test
+        state: absent
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      tags:
+        - security
+
+    - name: Create production application database
       mysql_db:
         name: "{{ db_name }}"
+        encoding: "{{ db_encoding }}"
+        collation: "{{ db_collation }}"
         state: present
         login_user: root
         login_password: "{{ mysql_root_password }}"
+      tags:
+        - database
 
-    - name: Create Database User with Privileges
+    - name: Create dedicated application database user with scoped privileges
       mysql_user:
         name: "{{ db_user }}"
         password: "{{ db_password }}"
@@ -48,11 +164,46 @@
         state: present
         login_user: root
         login_password: "{{ mysql_root_password }}"
+      tags:
+        - database
+        - user
 
-    - name: Remove Anonymous Users
-      mysql_user:
-        name: ""
-        host_all: yes
-        state: absent
-        login_user: root
-        login_password: "{{ mysql_root_password }}"
+    - name: Configure UFW firewall rule for MySQL port
+      ufw:
+        rule: allow
+        port: "{{ mysql_port }}"
+        proto: tcp
+      when: mysql_bind_address != "127.0.0.1"
+      tags:
+        - firewall
+
+    - name: Verify MySQL server responsiveness
+      command: mysqladmin --defaults-file=/root/.my.cnf ping
+      register: mysql_ping_res
+      changed_when: false
+      retries: 3
+      delay: 2
+      until: "'mysqld is alive' in mysql_ping_res.stdout"
+      tags:
+        - verify
+
+    - name: Display MySQL deployment audit summary
+      debug:
+        msg:
+          - "MySQL Server is healthy and listening on {{ mysql_bind_address }}:{{ mysql_port }}."
+          - "Target Database: {{ db_name }} ({{ db_encoding }}/{{ db_collation }})."
+          - "Application User: {{ db_user }} configured with scoped access."
+          - "Ping status: {{ mysql_ping_res.stdout }}"
+      tags:
+        - verify
+
+  handlers:
+    - name: Restart MySQL
+      service:
+        name: mysql
+        state: restarted
+
+    - name: Reload MySQL
+      service:
+        name: mysql
+        state: reloaded
