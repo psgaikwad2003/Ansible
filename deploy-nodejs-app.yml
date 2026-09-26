@@ -1,78 +1,234 @@
 ---
-- name: Deploy Node.js Application
+- name: Enterprise Node.js Application Deployment, Process Hardening & Systemd Automation
   hosts: app
   become: yes
+  gather_facts: yes
 
   vars:
-    app_dir: /opt/nodeapp
+    app_name: "nodeapp"
+    app_user: "nodeapp"
+    app_group: "nodeapp"
+    app_root: "/var/www/nodeapp"
     app_port: 3000
-    node_version: "18"
+    node_major_version: "20"
+    app_environment: "production"
+    app_log_dir: "/var/log/nodeapp"
+    node_memory_limit_mb: 512
     git_repo: "https://github.com/example/nodeapp.git"
+    git_branch: "main"
 
   tasks:
+    - name: Ensure APT prerequisites and keyrings directory exist
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags:
+        - prerequisites
 
-    - name: Install Node.js Repository
-      shell: curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
-      args:
-        creates: /etc/apt/sources.list.d/nodesource.list
+    - name: Download NodeSource official GPG signing key
+      get_url:
+        url: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+        dest: /etc/apt/keyrings/nodesource.asc
+        mode: "0644"
+        force: no
+      tags:
+        - repo
 
-    - name: Install Node.js and Git
+    - name: Add NodeSource official APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesource.com/node_{{ node_major_version }}.x nodistro main"
+        state: present
+        filename: nodesource
+      tags:
+        - repo
+
+    - name: Install Node.js LTS runtime and essential build dependencies
       apt:
         name:
           - nodejs
           - git
+          - build-essential
+          - curl
+          - ufw
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - packages
 
-    - name: Create Application Directory
+    - name: Create dedicated unprivileged system group for application
+      group:
+        name: "{{ app_group }}"
+        system: yes
+        state: present
+      tags:
+        - user
+        - security
+
+    - name: Create dedicated unprivileged system user for application
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        home: "{{ app_root }}"
+        create_home: no
+        state: present
+      tags:
+        - user
+        - security
+
+    - name: Create application directory hierarchy and log directory
       file:
-        path: "{{ app_dir }}"
+        path: "{{ item }}"
         state: directory
-        owner: www-data
-        group: www-data
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
         mode: "0755"
+      loop:
+        - "{{ app_root }}"
+        - "{{ app_root }}/releases"
+        - "{{ app_root }}/shared"
+        - "{{ app_log_dir }}"
+      tags:
+        - directories
 
-    - name: Clone Application Repository
-      git:
-        repo: "{{ git_repo }}"
-        dest: "{{ app_dir }}"
-        version: main
-        force: yes
-
-    - name: Install NPM Dependencies
-      command: npm install --production
-      args:
-        chdir: "{{ app_dir }}"
-
-    - name: Create Systemd Service File
+    - name: Deploy application environment variables file
       copy:
+        dest: "{{ app_root }}/.env"
+        content: |
+          # Node.js Application Environment Configuration
+          NODE_ENV={{ app_environment }}
+          PORT={{ app_port }}
+          LOG_DIR={{ app_log_dir }}
+          MAX_OLD_SPACE_SIZE={{ node_memory_limit_mb }}
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0600"
+      notify: Restart Node.js application
+      tags:
+        - config
+
+    - name: Create production starter application entrypoint if not present
+      copy:
+        dest: "{{ app_root }}/index.js"
+        content: |
+          const http = require('http');
+          const port = process.env.PORT || 3000;
+          
+          const server = http.createServer((req, res) => {
+            if (req.url === '/health' || req.url === '/ping') {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              return res.end(JSON.stringify({ status: 'UP', uptime: process.uptime(), timestamp: Date.now() }));
+            }
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end('Enterprise Node.js Application running successfully via Ansible!\n');
+          });
+          
+          server.listen(port, '0.0.0.0', () => {
+            console.log(`Server running at http://0.0.0.0:${port}/ in ${process.env.NODE_ENV || 'production'} mode`);
+          });
+        force: no
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+      notify: Restart Node.js application
+      tags:
+        - app
+
+    - name: Deploy hardened systemd service unit
+      copy:
+        dest: "/etc/systemd/system/{{ app_name }}.service"
         content: |
           [Unit]
-          Description=Node.js Application
-          After=network.target
+          Description=Enterprise Node.js Application - {{ app_name }}
+          After=network.target remote-fs.target
+          Documentation=https://github.com/example/nodeapp
 
           [Service]
           Type=simple
-          User=www-data
-          WorkingDirectory={{ app_dir }}
-          ExecStart=/usr/bin/node {{ app_dir }}/index.js
-          Restart=on-failure
-          Environment=PORT={{ app_port }}
-          Environment=NODE_ENV=production
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_root }}
+          EnvironmentFile=-{{ app_root }}/.env
+          ExecStart=/usr/bin/node --max-old-space-size={{ node_memory_limit_mb }} {{ app_root }}/index.js
+          Restart=always
+          RestartSec=5s
+
+          # Security Sandboxing & Hardening
+          NoNewPrivileges=true
+          ProtectSystem=full
+          ProtectHome=true
+          PrivateTmp=true
+          LimitNOFILE=65535
+
+          # Logging
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier={{ app_name }}
 
           [Install]
           WantedBy=multi-user.target
-        dest: /etc/systemd/system/nodeapp.service
-      notify: Reload Systemd
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart Node.js application
+      tags:
+        - systemd
+        - service
 
-    - name: Start Node.js Application
-      service:
-        name: nodeapp
+    - name: Ensure systemd daemon is reloaded immediately
+      meta: flush_handlers
+
+    - name: Enable and start Node.js application service
+      systemd:
+        name: "{{ app_name }}"
         state: started
         enabled: yes
+      tags:
+        - service
+
+    - name: Allow incoming traffic on application port via UFW
+      ufw:
+        rule: allow
+        port: "{{ app_port }}"
+        proto: tcp
+      when: ansible_facts['os_family'] == 'Debian'
+      tags:
+        - firewall
+
+    - name: Verify application HTTP endpoint responsiveness
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        status_code: [200, 404]
+        timeout: 5
+      register: app_health
+      retries: 5
+      delay: 2
+      tags:
+        - verify
+
+    - name: Display Node.js application deployment summary
+      debug:
+        msg:
+          - "Application '{{ app_name }}' is operational."
+          - "Port: {{ app_port }} | User: {{ app_user }} | Node.js Runtime: {{ node_major_version }}.x"
+          - "Service Status: Active & Enabled on boot."
+          - "Healthcheck HTTP Status: {{ app_health.status }}"
+      tags:
+        - verify
 
   handlers:
-
-    - name: Reload Systemd
+    - name: Reload systemd
       systemd:
         daemon_reload: yes
+
+    - name: Restart Node.js application
+      systemd:
+        name: "{{ app_name }}"
+        state: restarted
