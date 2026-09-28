@@ -1,5 +1,5 @@
 ---
-- name: Install and Configure PostgreSQL Database Server
+- name: Install and Harden PostgreSQL Database Server
   hosts: db
   become: yes
 
@@ -10,14 +10,23 @@
     db_password: "SecureDbPassword@2026"
     listen_addresses: "localhost"
     postgres_port: 5432
+    max_connections: 100
+    shared_buffers: "512MB"
+    effective_cache_size: "1536MB"
+    maintenance_work_mem: "128MB"
+    work_mem: "16MB"
+    checkpoint_completion_target: "0.9"
+    wal_buffers: "16MB"
+    db_extensions:
+      - uuid-ossp
+      - pg_stat_statements
 
   tasks:
-
     - name: Install PostgreSQL Server and Dependencies
       apt:
         name:
-          - postgresql
-          - postgresql-contrib
+          - postgresql-{{ postgres_version }}
+          - postgresql-contrib-{{ postgres_version }}
           - python3-psycopg2
           - libpq-dev
         state: present
@@ -29,39 +38,58 @@
         state: started
         enabled: yes
 
-    - name: Configure PostgreSQL Listen Addresses
+    - name: Configure PostgreSQL Core Networking and Ports
       lineinfile:
         path: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
-        regexp: "^#?listen_addresses\\s*="
-        line: "listen_addresses = '{{ listen_addresses }}'"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
         state: present
+      loop:
+        - { regexp: "^#?listen_addresses\\s*=", line: "listen_addresses = '{{ listen_addresses }}'" }
+        - { regexp: "^#?port\\s*=", line: "port = {{ postgres_port }}" }
       notify: Restart PostgreSQL
       ignore_errors: yes
 
-    - name: Configure PostgreSQL Port
+    - name: Configure Production Memory and Performance Tuning Parameters
       lineinfile:
         path: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
-        regexp: "^#?port\\s*="
-        line: "port = {{ postgres_port }}"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
         state: present
+      loop:
+        - { regexp: "^#?max_connections\\s*=", line: "max_connections = {{ max_connections }}" }
+        - { regexp: "^#?shared_buffers\\s*=", line: "shared_buffers = {{ shared_buffers }}" }
+        - { regexp: "^#?effective_cache_size\\s*=", line: "effective_cache_size = {{ effective_cache_size }}" }
+        - { regexp: "^#?maintenance_work_mem\\s*=", line: "maintenance_work_mem = {{ maintenance_work_mem }}" }
+        - { regexp: "^#?work_mem\\s*=", line: "work_mem = {{ work_mem }}" }
+        - { regexp: "^#?wal_buffers\\s*=", line: "wal_buffers = {{ wal_buffers }}" }
+        - { regexp: "^#?checkpoint_completion_target\\s*=", line: "checkpoint_completion_target = {{ checkpoint_completion_target }}" }
+        - { regexp: "^#?shared_preload_libraries\\s*=", line: "shared_preload_libraries = 'pg_stat_statements'" }
+        - { regexp: "^#?password_encryption\\s*=", line: "password_encryption = scram-sha-256" }
       notify: Restart PostgreSQL
       ignore_errors: yes
+
+    - name: Flush Handlers to Apply Initial PostgreSQL Configuration
+      meta: flush_handlers
 
     - name: Create PostgreSQL Application Database
       become_user: postgres
       postgresql_db:
         name: "{{ db_name }}"
         encoding: "UTF-8"
+        lc_collate: "C.UTF-8"
+        lc_ctype: "C.UTF-8"
         state: present
 
-    - name: Create PostgreSQL Database User with Password
+    - name: Create PostgreSQL Database User with Encrypted Password
       become_user: postgres
       postgresql_user:
         name: "{{ db_user }}"
         password: "{{ db_password }}"
+        encrypted: yes
         state: present
 
-    - name: Grant All Privileges on Database to User
+    - name: Grant All Privileges on Database to Application User
       become_user: postgres
       postgresql_privs:
         type: database
@@ -70,7 +98,16 @@
         privs: ALL
         state: present
 
-    - name: Allow MD5 Password Authentication for Database User in pg_hba.conf
+    - name: Enable Recommended Database Extensions
+      become_user: postgres
+      postgresql_ext:
+        name: "{{ item }}"
+        db: "{{ db_name }}"
+        state: present
+      loop: "{{ db_extensions }}"
+      ignore_errors: yes
+
+    - name: Configure SCRAM-SHA-256 Authentication in pg_hba.conf
       lineinfile:
         path: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.conf"
         line: "host    {{ db_name }}     {{ db_user }}     127.0.0.1/32            scram-sha-256"
@@ -79,16 +116,24 @@
       notify: Restart PostgreSQL
       ignore_errors: yes
 
-  handlers:
+    - name: Verify PostgreSQL Database Connection and Query Execution
+      become_user: postgres
+      command: "psql -d {{ db_name }} -c 'SELECT current_database(), current_user, version();'"
+      register: psql_healthcheck
+      changed_when: false
+      failed_when: false
 
+    - name: Display PostgreSQL Deployment and Health Status
+      debug:
+        msg:
+          - "PostgreSQL {{ postgres_version }} server configured."
+          - "Database: {{ db_name }} (Encoding: UTF-8)"
+          - "User: {{ db_user }} (Auth: SCRAM-SHA-256)"
+          - "Shared Buffers: {{ shared_buffers }} | Effective Cache: {{ effective_cache_size }}"
+          - "Connection Test: {{ 'Passed' if psql_healthcheck.rc == 0 else 'Notice: skipped local query test' }}"
+
+  handlers:
     - name: Restart PostgreSQL
       service:
         name: postgresql
         state: restarted
-
-    - name: Display PostgreSQL Deployment Status
-      debug:
-        msg: "PostgreSQL 16 server is installed and configured. Database '{{ db_name }}' and user '{{ db_user }}' are ready." 
-    
-    - name: Flush handlers to ensure PostgreSQL configuration is active
-      meta: flush_handlers 
