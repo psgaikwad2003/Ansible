@@ -1,5 +1,5 @@
 ---
-- name: Install and Configure Redis In-Memory Cache Server
+- name: Install and Harden Redis In-Memory Cache Server
   hosts: cache
   become: yes
 
@@ -9,14 +9,41 @@
     redis_max_memory: "256mb"
     redis_max_memory_policy: "allkeys-lru"
     redis_password: "RedisSecretPassword@2026"
+    redis_appendonly: "yes"
+    redis_appendfsync: "everysec"
+    redis_tcp_backlog: 65535
+    redis_timeout: 300
+    redis_tcp_keepalive: 300
     redis_save_snapshots:
       - "900 1"
       - "300 10"
       - "60 10000"
+    redis_rename_dangerous_commands:
+      - original: "FLUSHALL"
+        renamed: '""'
+      - original: "FLUSHDB"
+        renamed: '""'
+      - original: "DEBUG"
+        renamed: '""'
 
   tasks:
+    - name: Tune Linux Kernel Memory Overcommit for Redis Performance
+      sysctl:
+        name: vm.overcommit_memory
+        value: "1"
+        state: present
+        reload: yes
+      ignore_errors: yes
 
-    - name: Install Redis Server
+    - name: Tune Network Socket Max Connections for Redis
+      sysctl:
+        name: net.core.somaxconn
+        value: "{{ redis_tcp_backlog }}"
+        state: present
+        reload: yes
+      ignore_errors: yes
+
+    - name: Install Redis Server and Tooling
       apt:
         name:
           - redis-server
@@ -27,16 +54,25 @@
     - name: Configure Redis Port
       lineinfile:
         path: /etc/redis/redis.conf
-        regexp: "^port "
+        regexp: "^#?port "
         line: "port {{ redis_port }}"
         state: present
+        backup: yes
       notify: Restart Redis
 
     - name: Configure Redis Bind Address
       lineinfile:
         path: /etc/redis/redis.conf
-        regexp: "^bind "
+        regexp: "^#?bind "
         line: "bind {{ redis_bind_interface }} ::1"
+        state: present
+      notify: Restart Redis
+
+    - name: Configure Redis Protected Mode
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^#?protected-mode "
+        line: "protected-mode yes"
         state: present
       notify: Restart Redis
 
@@ -64,26 +100,67 @@
         state: present
       notify: Restart Redis
 
+    - name: Configure Redis TCP Keepalive and Timeout
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: "^#?timeout ", line: "timeout {{ redis_timeout }}" }
+        - { regexp: "^#?tcp-keepalive ", line: "tcp-keepalive {{ redis_tcp_keepalive }}" }
+      notify: Restart Redis
+
+    - name: Configure Redis AOF Persistence
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: "^#?appendonly ", line: "appendonly {{ redis_appendonly }}" }
+        - { regexp: "^#?appendfsync ", line: "appendfsync {{ redis_appendfsync }}" }
+      notify: Restart Redis
+
+    - name: Disable Dangerous Commands in Production
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^rename-command {{ item.original }} "
+        line: "rename-command {{ item.original }} {{ item.renamed }}"
+        state: present
+      loop: "{{ redis_rename_dangerous_commands }}"
+      notify: Restart Redis
+
     - name: Ensure Redis Service is Started and Enabled
       service:
         name: redis-server
         state: started
         enabled: yes
 
-    - name: Verify Redis Service Responsiveness
-      command: "redis-cli -a '{{ redis_password }}' ping"
+    - name: Verify Redis Service Responsiveness via PING
+      command: "redis-cli -p {{ redis_port }} -a '{{ redis_password }}' ping"
       register: redis_ping_result
       changed_when: false
       retries: 3
       delay: 2
       until: redis_ping_result.stdout == "PONG"
+      ignore_errors: yes
 
-    - name: Display Redis Health Status
+    - name: Query Redis Operational Memory Metrics
+      command: "redis-cli -p {{ redis_port }} -a '{{ redis_password }}' info memory"
+      register: redis_mem_info
+      changed_when: false
+      failed_when: false
+
+    - name: Display Redis Health and Memory Status
       debug:
-        msg: "Redis health check response: {{ redis_ping_result.stdout }}"
+        msg:
+          - "Redis PING check: {{ redis_ping_result.stdout | default('Skipped / Offline') }}"
+          - "Listening on: {{ redis_bind_interface }}:{{ redis_port }}"
+          - "Max Memory: {{ redis_max_memory }} (Policy: {{ redis_max_memory_policy }})"
+          - "AOF Persistence: {{ redis_appendonly }} (Sync: {{ redis_appendfsync }})"
 
   handlers:
-
     - name: Restart Redis
       service:
         name: redis-server
