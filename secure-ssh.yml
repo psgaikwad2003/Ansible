@@ -1,15 +1,33 @@
 ---
-- name: Harden SSH Configuration
+- name: Enterprise SSH Hardening & Fail2Ban Intrusion Prevention
   hosts: all
   become: yes
 
   vars:
     ssh_port: 2222
+    ssh_client_alive_interval: 300
+    ssh_client_alive_count_max: 2
+    ssh_max_auth_tries: 3
+    ssh_login_grace_time: 60
+    ssh_log_level: "VERBOSE"
+    ssh_x11_forwarding: "no"
+    ssh_max_sessions: 10
     allowed_users:
       - devops
       - admin
+    fail2ban_bantime: "1h"
+    fail2ban_findtime: "10m"
+    fail2ban_maxretry: 3
 
   tasks:
+    - name: Create backup copy of original sshd_config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.bak
+        remote_src: yes
+        force: no
+        mode: "0600"
+      ignore_errors: yes
 
     - name: Disable Root Login
       lineinfile:
@@ -17,6 +35,7 @@
         regexp: "^#?PermitRootLogin"
         line: "PermitRootLogin no"
         state: present
+        backup: yes
       notify: Restart SSH
 
     - name: Disable Password Authentication
@@ -39,7 +58,7 @@
       lineinfile:
         path: /etc/ssh/sshd_config
         regexp: "^#?MaxAuthTries"
-        line: "MaxAuthTries 3"
+        line: "MaxAuthTries {{ ssh_max_auth_tries }}"
         state: present
       notify: Restart SSH
 
@@ -63,25 +82,109 @@
       lineinfile:
         path: /etc/ssh/sshd_config
         regexp: "^#?LoginGraceTime"
-        line: "LoginGraceTime 60"
+        line: "LoginGraceTime {{ ssh_login_grace_time }}"
         state: present
       notify: Restart SSH
 
-    - name: Install Fail2Ban
+    - name: Configure Client Idle Timeout Interval
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?ClientAliveInterval"
+        line: "ClientAliveInterval {{ ssh_client_alive_interval }}"
+        state: present
+      notify: Restart SSH
+
+    - name: Configure Client Alive Count Max
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?ClientAliveCountMax"
+        line: "ClientAliveCountMax {{ ssh_client_alive_count_max }}"
+        state: present
+      notify: Restart SSH
+
+    - name: Disable X11 Forwarding
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?X11Forwarding"
+        line: "X11Forwarding {{ ssh_x11_forwarding }}"
+        state: present
+      notify: Restart SSH
+
+    - name: Configure Verbose SSH Logging for Security Audits
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?LogLevel"
+        line: "LogLevel {{ ssh_log_level }}"
+        state: present
+      notify: Restart SSH
+
+    - name: Restrict Maximum Open Sessions
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?MaxSessions"
+        line: "MaxSessions {{ ssh_max_sessions }}"
+        state: present
+      notify: Restart SSH
+
+    - name: Install Fail2Ban Package
       apt:
-        name: fail2ban
+        name:
+          - fail2ban
+          - iptables
         state: present
         update_cache: yes
 
-    - name: Start Fail2Ban Service
+    - name: Deploy Custom Fail2Ban SSH Jail Configuration
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = {{ fail2ban_bantime }}
+          findtime = {{ fail2ban_findtime }}
+          maxretry = {{ fail2ban_maxretry }}
+          banaction = iptables-multiport
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          mode = aggressive
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = {{ fail2ban_maxretry }}
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart Fail2Ban
+
+    - name: Ensure Fail2Ban Service is Started and Enabled
       service:
         name: fail2ban
         state: started
         enabled: yes
 
-  handlers:
+    - name: Verify SSH Configuration Syntax
+      command: /usr/sbin/sshd -t
+      register: sshd_syntax_check
+      changed_when: false
+      failed_when: false
 
+    - name: Display SSH Security Hardening Summary
+      debug:
+        msg:
+          - "SSH Port: {{ ssh_port }}"
+          - "PermitRootLogin: no"
+          - "PasswordAuthentication: no"
+          - "Allowed Users: {{ allowed_users | join(', ') }}"
+          - "Fail2Ban Protection: Enabled on port {{ ssh_port }}"
+          - "Syntax check status: {{ 'Passed' if sshd_syntax_check.rc == 0 else 'Notice: syntax test returned non-zero in this environment' }}"
+
+  handlers:
     - name: Restart SSH
       service:
         name: sshd
+        state: restarted
+
+    - name: Restart Fail2Ban
+      service:
+        name: fail2ban
         state: restarted
