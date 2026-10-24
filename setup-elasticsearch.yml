@@ -1,0 +1,179 @@
+---
+- name: Install and Configure Production Elasticsearch Single-Node Cluster
+  hosts: elasticsearch_servers
+  become: yes
+
+  vars:
+    elastic_branch: "8.x"
+    es_cluster_name: "enterprise-search-cluster"
+    es_node_name: "{{ inventory_hostname | default('es-node-01') }}"
+    es_http_port: 9200
+    es_transport_port: 9300
+    es_heap_size: "2g"
+    es_data_dir: "/var/lib/elasticsearch"
+    es_log_dir: "/var/log/elasticsearch"
+    elastic_keyring: "/etc/apt/keyrings/elasticsearch-keyring.gpg"
+
+  handlers:
+    - name: Restart Elasticsearch
+      systemd:
+        name: elasticsearch
+        state: restarted
+        daemon_reload: yes
+
+  tasks:
+
+    - name: Install Base Dependencies and Security Libraries
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+          - default-jre-headless
+          - ufw
+        state: present
+        update_cache: yes
+
+    - name: Configure Linux Kernel Memory Maps for Elasticsearch (vm.max_map_count)
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/99-elasticsearch.conf
+      loop:
+        - { name: 'vm.max_map_count', value: '262144' }
+        - { name: 'vm.swappiness', value: '1' }
+
+    - name: Configure Security Limits for Elasticsearch User
+      copy:
+        dest: /etc/security/limits.d/99-elasticsearch.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          elasticsearch soft memlock unlimited
+          elasticsearch hard memlock unlimited
+          elasticsearch soft nofile 65536
+          elasticsearch hard nofile 65536
+          elasticsearch soft nproc 4096
+          elasticsearch hard nproc 4096
+
+    - name: Ensure APT Keyrings Directory Exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Add Elastic Official GPG Key
+      apt_key:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        state: present
+        keyring: "{{ elastic_keyring }}"
+
+    - name: Add Elastic Official APT Repository
+      apt_repository:
+        repo: "deb [signed-by={{ elastic_keyring }}] https://artifacts.elastic.co/packages/{{ elastic_branch }}/apt stable main"
+        state: present
+        filename: elastic-{{ elastic_branch }}
+
+    - name: Install Elasticsearch Package
+      apt:
+        name: elasticsearch
+        state: present
+        update_cache: yes
+
+    - name: Configure Systemd Memory Lock Limits Override for Elasticsearch
+      file:
+        path: /etc/systemd/system/elasticsearch.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy Systemd LimitMEMLOCK Override Unit
+      copy:
+        dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          LimitMEMLOCK=infinity
+          LimitNOFILE=65536
+          LimitNPROC=4096
+      notify: Restart Elasticsearch
+
+    - name: Configure JVM Heap Allocation Options
+      copy:
+        dest: /etc/elasticsearch/jvm.options.d/heap.options
+        owner: root
+        group: elasticsearch
+        mode: "0640"
+        content: |
+          # Elasticsearch Production Heap Sizing
+          -Xms{{ es_heap_size }}
+          -Xmx{{ es_heap_size }}
+      notify: Restart Elasticsearch
+
+    - name: Deploy Elasticsearch Server Configuration
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+        content: |
+          # Elasticsearch Enterprise Node Configuration
+          cluster.name: {{ es_cluster_name }}
+          node.name: {{ es_node_name }}
+          path.data: {{ es_data_dir }}
+          path.logs: {{ es_log_dir }}
+          network.host: 0.0.0.0
+          http.port: {{ es_http_port }}
+          transport.port: {{ es_transport_port }}
+          discovery.type: single-node
+          bootstrap.memory_lock: true
+          xpack.security.enabled: false
+      notify: Restart Elasticsearch
+
+    - name: Flush Handlers to Ensure Elasticsearch is Started
+      meta: flush_handlers
+
+    - name: Ensure Elasticsearch Service is Enabled and Started
+      systemd:
+        name: elasticsearch
+        state: started
+        enabled: yes
+
+    - name: Configure UFW Firewall Ingress for HTTP and Transport Ports
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "{{ es_http_port }}"
+        - "{{ es_transport_port }}"
+      when: ansible_facts['os_family'] == "Debian"
+
+    - name: Verify Elasticsearch Cluster Health API Response
+      uri:
+        url: "http://127.0.0.1:{{ es_http_port }}/_cluster/health"
+        method: GET
+        status_code: 200
+      register: es_health
+      retries: 10
+      delay: 5
+      until: es_health.status == 200
+
+    - name: Output Elasticsearch Cluster Status Information
+      debug:
+        msg:
+          - "Elasticsearch Status  : Running"
+          - "Cluster Name          : {{ es_health.json.cluster_name }}"
+          - "Cluster Status        : {{ es_health.json.status }}"
+          - "Active Shards         : {{ es_health.json.active_primary_shards }}"
+          - "HTTP Endpoint         : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ es_http_port }}"
