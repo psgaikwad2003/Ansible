@@ -1,0 +1,205 @@
+---
+- name: Deploy and Configure HashiCorp Vault Secrets Management Server
+  hosts: vault_servers
+  become: yes
+
+  vars:
+    vault_api_port: 8200
+    vault_cluster_port: 8201
+    vault_storage_dir: "/opt/vault/data"
+    vault_config_dir: "/etc/vault.d"
+    vault_user: "vault"
+    vault_group: "vault"
+    hashicorp_keyring: "/etc/apt/keyrings/hashicorp-archive-keyring.gpg"
+
+  handlers:
+    - name: Restart Vault
+      systemd:
+        name: vault
+        state: restarted
+        daemon_reload: yes
+
+  tasks:
+
+    - name: Install Common Dependencies and Security Tools
+      apt:
+        name:
+          - curl
+          - gnupg
+          - software-properties-common
+          - libcap2-bin
+          - jq
+          - ufw
+        state: present
+        update_cache: yes
+
+    - name: Ensure Keyrings Directory Exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Add HashiCorp Official GPG Key
+      apt_key:
+        url: https://apt.releases.hashicorp.com/gpg
+        state: present
+        keyring: "{{ hashicorp_keyring }}"
+
+    - name: Add HashiCorp Official APT Repository
+      apt_repository:
+        repo: "deb [signed-by={{ hashicorp_keyring }}] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+        state: present
+        filename: hashicorp
+
+    - name: Install HashiCorp Vault Package
+      apt:
+        name: vault
+        state: present
+        update_cache: yes
+
+    - name: Create Dedicated Vault System Group
+      group:
+        name: "{{ vault_group }}"
+        system: yes
+        state: present
+
+    - name: Create Dedicated Vault System User
+      user:
+        name: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        create_home: no
+        state: present
+
+    - name: Create Vault Storage and Configuration Directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: "0750"
+      loop:
+        - "{{ vault_config_dir }}"
+        - "{{ vault_storage_dir }}"
+
+    - name: Grant IPC Lock Capability to Vault Binary (Prevent Swapping Secrets)
+      capabilities:
+        path: /usr/bin/vault
+        capability: cap_ipc_lock=+ep
+        state: present
+
+    - name: Deploy Production Vault HCL Configuration
+      copy:
+        dest: "{{ vault_config_dir }}/vault.hcl"
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: "0640"
+        content: |
+          # HashiCorp Vault Production Configuration
+          ui = true
+          disable_mlock = false
+
+          storage "file" {
+            path = "{{ vault_storage_dir }}"
+          }
+
+          listener "tcp" {
+            address       = "0.0.0.0:{{ vault_api_port }}"
+            tls_disable   = 1
+          }
+
+          api_addr     = "http://127.0.0.1:{{ vault_api_port }}"
+          cluster_addr = "http://127.0.0.1:{{ vault_cluster_port }}"
+      notify: Restart Vault
+
+    - name: Deploy Vault Systemd Service Unit
+      copy:
+        dest: /etc/systemd/system/vault.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description="HashiCorp Vault - A tool for managing secrets"
+          Documentation=https://www.vaultproject.io/docs/
+          Requires=network-online.target
+          After=network-online.target
+          ConditionFileNotEmpty={{ vault_config_dir }}/vault.hcl
+
+          [Service]
+          User={{ vault_user }}
+          Group={{ vault_group }}
+          ProtectSystem=full
+          ProtectHome=read-only
+          PrivateTmp=yes
+          PrivateDevices=yes
+          SecureBits=keep-caps
+          AmbientCapabilities=CAP_IPC_LOCK
+          Capabilities=CAP_IPC_LOCK+ep
+          CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+          NoNewPrivileges=yes
+          ExecStart=/usr/bin/vault server -config={{ vault_config_dir }}/vault.hcl
+          ExecReload=/bin/kill --signal HUP $MAINPID
+          KillMode=process
+          KillSignal=SIGINT
+          Restart=on-failure
+          RestartSec=5
+          TimeoutStopSec=30
+          LimitNOFILE=65536
+          LimitMEMLOCK=infinity
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Vault
+
+    - name: Set Global Environment Variable for Vault CLI
+      copy:
+        dest: /etc/profile.d/vault.sh
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          export VAULT_ADDR="http://127.0.0.1:{{ vault_api_port }}"
+
+    - name: Flush Handlers to Ensure Vault is Started
+      meta: flush_handlers
+
+    - name: Ensure Vault Service is Started and Enabled
+      systemd:
+        name: vault
+        state: started
+        enabled: yes
+
+    - name: Configure UFW Firewall Ingress for Vault API Port
+      ufw:
+        rule: allow
+        port: "{{ vault_api_port }}"
+        proto: tcp
+      when: ansible_facts['os_family'] == "Debian"
+
+    - name: Verify Vault Health / Status API Endpoint
+      uri:
+        url: "http://127.0.0.1:{{ vault_api_port }}/v1/sys/health"
+        method: GET
+        status_code:
+          - 200
+          - 429
+          - 472
+          - 473
+          - 501
+          - 503
+      register: vault_health
+      retries: 5
+      delay: 2
+
+    - name: Output HashiCorp Vault Server Deployment Summary
+      debug:
+        msg:
+          - "Vault Status         : Started and Listening"
+          - "Vault API Endpoint   : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ vault_api_port }}"
+          - "Vault Web UI         : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ vault_api_port }}/ui"
+          - "Initialization Guide : Run 'vault operator init' on the node to initialize key shares"
+          - "Storage Engine       : File backend at {{ vault_storage_dir }}"
