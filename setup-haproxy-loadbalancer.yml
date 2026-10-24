@@ -1,0 +1,223 @@
+---
+- name: Install and Configure High-Availability HAProxy Load Balancer
+  hosts: loadbalancers
+  become: yes
+
+  vars:
+    haproxy_service_name: "haproxy"
+    haproxy_port: 80
+    haproxy_stats_port: 8404
+    haproxy_stats_user: "admin"
+    haproxy_stats_password: "AdminSecureStatsPass@2026"
+    max_connections: 50000
+    backend_mode: "http"
+    load_balance_algorithm: "roundrobin"
+    backend_servers:
+      - name: "app_node_01"
+        address: "192.168.1.101"
+        port: 8080
+      - name: "app_node_02"
+        address: "192.168.1.102"
+        port: 8080
+      - name: "app_node_03"
+        address: "192.168.1.103"
+        port: 8080
+
+  handlers:
+    - name: Restart HAProxy
+      service:
+        name: "{{ haproxy_service_name }}"
+        state: restarted
+
+    - name: Reload HAProxy
+      service:
+        name: "{{ haproxy_service_name }}"
+        state: reloaded
+
+    - name: Restart Rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
+  tasks:
+
+    - name: Update APT Cache and Install Prerequisites
+      apt:
+        name:
+          - curl
+          - software-properties-common
+          - rsyslog
+          - socat
+          - ufw
+        state: present
+        update_cache: yes
+
+    - name: Install HAProxy Package
+      apt:
+        name: haproxy
+        state: present
+
+    - name: Apply Kernel Sysctl Parameters for High-Throughput Load Balancing
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/99-haproxy.conf
+      loop:
+        - { name: 'net.ipv4.ip_nonlocal_bind', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+        - { name: 'net.core.somaxconn', value: '65535' }
+        - { name: 'net.ipv4.tcp_max_syn_backlog', value: '3240000' }
+        - { name: 'net.ipv4.tcp_fin_timeout', value: '15' }
+        - { name: 'net.ipv4.tcp_tw_reuse', value: '1' }
+
+    - name: Configure Rsyslog for HAProxy Logging Isolation
+      copy:
+        dest: /etc/rsyslog.d/49-haproxy.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # HAProxy isolated logging configuration
+          $ModLoad imudp
+          $UDPServerAddress 127.0.0.1
+          $UDPServerRun 514
+
+          local0.*    /var/log/haproxy.log
+          & stop
+      notify: Restart Rsyslog
+
+    - name: Ensure Dedicated HAProxy Log File Exists
+      file:
+        path: /var/log/haproxy.log
+        state: touch
+        owner: syslog
+        group: adm
+        mode: "0640"
+      changed_when: false
+
+    - name: Backup Default HAProxy Configuration
+      copy:
+        src: /etc/haproxy/haproxy.cfg
+        dest: /etc/haproxy/haproxy.cfg.bak
+        remote_src: yes
+        force: no
+
+    - name: Deploy Production HAProxy Configuration File
+      copy:
+        dest: /etc/haproxy/haproxy.cfg
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # HAProxy Enterprise Production Configuration
+          global
+              log 127.0.0.1 local0 notice
+              chroot /var/lib/haproxy
+              user haproxy
+              group haproxy
+              daemon
+              stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+              stats timeout 30s
+              maxconn {{ max_connections }}
+
+              # Modern secure SSL/TLS defaults
+              ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384
+              ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+              ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+
+          defaults
+              log     global
+              mode    {{ backend_mode }}
+              option  httplog
+              option  dontlognull
+              option  forwardfor
+              option  http-server-close
+              timeout connect 5000ms
+              timeout client  50000ms
+              timeout server  50000ms
+              timeout http-request 10000ms
+              timeout http-keep-alive 5000ms
+              retries 3
+              errorfile 400 /etc/haproxy/errors/400.http
+              errorfile 403 /etc/haproxy/errors/403.http
+              errorfile 408 /etc/haproxy/errors/408.http
+              errorfile 500 /etc/haproxy/errors/500.http
+              errorfile 502 /etc/haproxy/errors/502.http
+              errorfile 503 /etc/haproxy/errors/503.http
+              errorfile 504 /etc/haproxy/errors/504.http
+
+          # Dedicated Ingress HTTP Frontend
+          frontend http_in
+              bind *:{{ haproxy_port }}
+              mode http
+              http-request set-header X-Forwarded-Proto http
+              default_backend backend_cluster
+
+          # Application Backend Cluster Pool
+          backend backend_cluster
+              mode http
+              balance {{ load_balance_algorithm }}
+              option httpchk GET /health
+              http-check expect status 200
+              cookie SERVERID insert indirect nocache
+              {% for server in backend_servers %}
+              server {{ server.name }} {{ server.address }}:{{ server.port }} check inter 2000 rise 2 fall 3 cookie {{ server.name }}
+              {% endfor %}
+
+          # Metrics and Real-time Traffic Telemetry Dashboard
+          listen stats
+              bind *:{{ haproxy_stats_port }}
+              mode http
+              stats enable
+              stats uri /
+              stats refresh 10s
+              stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_password }}
+              stats admin if TRUE
+              stats show-legends
+              stats show-node
+        validate: 'haproxy -c -f %s'
+      notify: Reload HAProxy
+
+    - name: Flush Handlers to Ensure HAProxy is Reconfigured
+      meta: flush_handlers
+
+    - name: Ensure HAProxy Service is Started and Enabled on Boot
+      service:
+        name: "{{ haproxy_service_name }}"
+        state: started
+        enabled: yes
+
+    - name: Allow Traffic in UFW Firewall for HTTP and Stats
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "{{ haproxy_port }}"
+        - "{{ haproxy_stats_port }}"
+        - 443
+      when: ansible_facts['os_family'] == "Debian"
+
+    - name: Verify HAProxy Stats Interface Availability
+      uri:
+        url: "http://127.0.0.1:{{ haproxy_stats_port }}/"
+        method: GET
+        user: "{{ haproxy_stats_user }}"
+        password: "{{ haproxy_stats_password }}"
+        force_basic_auth: yes
+        status_code: 200
+      register: stats_response
+      retries: 5
+      delay: 2
+      until: stats_response.status == 200
+
+    - name: Output HAProxy Load Balancer Deployment Status
+      debug:
+        msg:
+          - "HAProxy Status         : Active and Running"
+          - "HTTP Ingress Port      : {{ haproxy_port }}"
+          - "Stats Dashboard URL    : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ haproxy_stats_port }}/"
+          - "Stats Dashboard User   : {{ haproxy_stats_user }}"
+          - "Configured Backends    : {{ backend_servers | length }} nodes registered"
