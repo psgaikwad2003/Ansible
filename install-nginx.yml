@@ -1,5 +1,5 @@
 ---
-- name: Production Nginx Web Server Installation & Hardening
+- name: Production Nginx Web Server Architecture, Concurrency Tuning & Security Hardening
   hosts: web
   become: yes
   gather_facts: yes
@@ -8,22 +8,116 @@
     nginx_port: 80
     server_domain: "{{ ansible_fqdn | default('localhost') }}"
     nginx_root: /var/www/html
+    worker_processes: "auto"
+    worker_connections: 4096
     client_max_body_size: "32M"
     keepalive_timeout: 65
     server_tokens: "off"
+    enable_rate_limiting: true
+    rate_limit_req_zone: "10r/s"
+    rate_limit_burst: 20
 
   tasks:
-    - name: Install Nginx HTTP server and dependencies
+    - name: Install Nginx HTTP server and performance dependencies
       apt:
         name:
           - nginx
           - curl
+          - logrotate
         state: present
         update_cache: yes
         cache_valid_time: 3600
       tags:
         - install
         - nginx
+
+    - name: Ensure web document root directory exists
+      file:
+        path: "{{ nginx_root }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+      tags:
+        - filesystem
+
+    - name: Configure global Nginx core performance settings (nginx.conf)
+      copy:
+        dest: /etc/nginx/nginx.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          user www-data;
+          worker_processes {{ worker_processes }};
+          pid /run/nginx.pid;
+          include /etc/nginx/modules-enabled/*.conf;
+
+          events {
+              worker_connections {{ worker_connections }};
+              multi_accept on;
+              use epoll;
+          }
+
+          http {
+              # Basic Settings
+              sendfile on;
+              tcp_nopush on;
+              tcp_nodelay on;
+              keepalive_timeout {{ keepalive_timeout }};
+              types_hash_max_size 2048;
+              server_tokens {{ server_tokens }};
+
+              # Buffer & Size Settings
+              client_max_body_size {{ client_max_body_size }};
+              client_body_buffer_size 128k;
+              client_header_buffer_size 1k;
+              large_client_header_buffers 4 8k;
+
+              # MIME Types
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+
+              # Structured JSON Access Log Format
+              log_format json_analytics escape=json '{'
+                  '"time_local":"$time_local",'
+                  '"remote_addr":"$remote_addr",'
+                  '"request_method":"$request_method",'
+                  '"request_uri":"$request_uri",'
+                  '"status": "$status",'
+                  '"body_bytes_sent":"$body_bytes_sent",'
+                  '"request_time":"$request_time",'
+                  '"http_referrer":"$http_referer",'
+                  '"http_user_agent":"$http_user_agent"'
+              '}';
+
+              access_log /var/log/nginx/access.log json_analytics;
+              error_log /var/log/nginx/error.log warn;
+
+              # Gzip Compression Settings
+              gzip on;
+              gzip_vary on;
+              gzip_proxied any;
+              gzip_comp_level 6;
+              gzip_buffers 16 8k;
+              gzip_http_version 1.1;
+              gzip_min_length 256;
+              gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+              # Rate Limiting Zones
+              {% if enable_rate_limiting | bool %}
+              limit_req_zone $binary_remote_addr zone=api_limit_per_ip:10m rate={{ rate_limit_req_zone }};
+              limit_conn_zone $binary_remote_addr zone=addr_conn_limit:10m;
+              {% endif %}
+
+              # Virtual Host Configurations
+              include /etc/nginx/conf.d/*.conf;
+              include /etc/nginx/sites-enabled/*;
+          }
+      notify: Reload Nginx
+      tags:
+        - config
+        - performance
 
     - name: Remove default Nginx virtual host configuration
       file:
@@ -33,9 +127,12 @@
       tags:
         - config
 
-    - name: Configure production Nginx virtual host
+    - name: Configure production virtual host with rate limiting and security headers
       copy:
         dest: "/etc/nginx/sites-available/production.conf"
+        owner: root
+        group: root
+        mode: "0644"
         content: |
           server {
               listen {{ nginx_port }} default_server;
@@ -45,42 +142,46 @@
               root {{ nginx_root }};
               index index.html index.htm;
 
-              server_tokens {{ server_tokens }};
-              client_max_body_size {{ client_max_body_size }};
-              keepalive_timeout {{ keepalive_timeout }};
-
-              # Security Headers
+              # Enterprise Security Headers
               add_header X-Frame-Options "SAMEORIGIN" always;
               add_header X-XSS-Protection "1; mode=block" always;
               add_header X-Content-Type-Options "nosniff" always;
               add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+              add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
 
-              # Gzip Compression
-              gzip on;
-              gzip_vary on;
-              gzip_min_length 1024;
-              gzip_proxied expired no-cache no-store private auth;
-              gzip_types text/plain text/css text/xml text/javascript application/x-javascript application/xml application/json;
+              # Rate limiting enforcement
+              {% if enable_rate_limiting | bool %}
+              limit_req zone=api_limit_per_ip burst={{ rate_limit_burst }} nodelay;
+              limit_conn addr_conn_limit 20;
+              {% endif %}
 
               location / {
                   try_files $uri $uri/ =404;
               }
 
+              # Application Health Check Endpoint
               location /healthz {
                   access_log off;
                   return 200 "OK\n";
                   add_header Content-Type text/plain;
               }
 
+              # Prometheus Scrape / Stub Status (Internal loopback only)
+              location /nginx_status {
+                  stub_status on;
+                  access_log off;
+                  allow 127.0.0.1;
+                  allow ::1;
+                  deny all;
+              }
+
               error_page 404 /404.html;
               error_page 500 502 503 504 /50x.html;
           }
-        owner: root
-        group: root
-        mode: "0644"
       notify: Reload Nginx
       tags:
         - config
+        - security
 
     - name: Enable production virtual host site
       file:
@@ -118,11 +219,19 @@
       tags:
         - verify
 
-    - name: Display Nginx deployment status
+    - name: Display Nginx Deployment & Concurrency Status
       debug:
-        msg: "Nginx web server is operational on port {{ nginx_port }}. Healthcheck response: '{{ health_check.content | trim }}'."
+        msg:
+          - "================ NGINX DEPLOYMENT SUMMARY ================"
+          - "Port             : {{ nginx_port }}"
+          - "Worker Processes : {{ worker_processes }} (Connections: {{ worker_connections }})"
+          - "Rate Limiting    : {{ 'Enabled (' ~ rate_limit_req_zone ~ ')' if enable_rate_limiting else 'Disabled' }}"
+          - "Health Endpoint  : http://127.0.0.1:{{ nginx_port }}/healthz (Status: {{ health_check.status }})"
+          - "Stub Status URL  : http://127.0.0.1:{{ nginx_port }}/nginx_status"
+          - "=========================================================="
       tags:
         - verify
+        - report
 
   handlers:
     - name: Reload Nginx
