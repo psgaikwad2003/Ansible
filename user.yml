@@ -1,5 +1,5 @@
 ---
-- name: Enterprise User Provisioning & Sudo Security Hardening
+- name: Enterprise DevOps Administrator Provisioning & PAM Security Hardening
   hosts: all
   become: yes
   gather_facts: yes
@@ -14,21 +14,37 @@
     additional_groups:
       - sudo
       - adm
+      - systemd-journal
     sudo_nopasswd: true
-    # Provide public key string or comment placeholder
+    sudoers_timeout_minutes: 15
     ssh_public_key: ""
+    generate_ed25519_keypair: true
+    password_max_age_days: 90
+    password_min_age_days: 7
+    password_warn_age_days: 14
+    security_limits_nofile: 65536
+    security_limits_nproc: 4096
 
   tasks:
-    - name: Ensure primary group exists
+    - name: Ensure secondary administrative groups exist
+      group:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ additional_groups }}"
+      tags:
+        - identity
+        - groups
+
+    - name: Ensure primary DevOps group exists with deterministic GID
       group:
         name: "{{ admin_group }}"
         gid: "{{ admin_gid }}"
         state: present
       tags:
-        - user
-        - group
+        - identity
+        - groups
 
-    - name: Provision admin user account
+    - name: Provision DevOps administrator user account
       user:
         name: "{{ admin_user }}"
         group: "{{ admin_group }}"
@@ -40,9 +56,21 @@
         create_home: yes
         state: present
       tags:
-        - user
+        - identity
+        - users
 
-    - name: Create secure .ssh directory for admin user
+    - name: Configure password aging and rotation compliance policy
+      command: >
+        chage -M {{ password_max_age_days }}
+        -m {{ password_min_age_days }}
+        -W {{ password_warn_age_days }}
+        {{ admin_user }}
+      changed_when: false
+      tags:
+        - security
+        - compliance
+
+    - name: Create secure .ssh directory with restricted mode
       file:
         path: "/home/{{ admin_user }}/.ssh"
         state: directory
@@ -53,7 +81,19 @@
         - ssh
         - security
 
-    - name: Deploy authorized SSH key if provided
+    - name: Generate Ed25519 SSH keypair if not already present
+      openssh_keypair:
+        path: "/home/{{ admin_user }}/.ssh/id_ed25519"
+        type: ed25519
+        owner: "{{ admin_user }}"
+        group: "{{ admin_group }}"
+        mode: "0600"
+      when: generate_ed25519_keypair | bool
+      tags:
+        - ssh
+        - keygen
+
+    - name: Deploy authorized SSH public key for remote key-based access
       authorized_key:
         user: "{{ admin_user }}"
         state: present
@@ -62,31 +102,67 @@
       tags:
         - ssh
 
-    - name: Configure passwordless sudo privileges in sudoers.d
+    - name: Configure PAM system security limits (nofile, nproc)
+      copy:
+        dest: "/etc/security/limits.d/90-{{ admin_user }}.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # PAM Security Limits for {{ admin_user }}
+          {{ admin_user }} soft nofile {{ security_limits_nofile }}
+          {{ admin_user }} hard nofile {{ security_limits_nofile }}
+          {{ admin_user }} soft nproc  {{ security_limits_nproc }}
+          {{ admin_user }} hard nproc  {{ security_limits_nproc }}
+      tags:
+        - security
+        - pam
+
+    - name: Configure hardened sudoers privileges with visudo validation
       copy:
         dest: "/etc/sudoers.d/90-{{ admin_user }}"
-        content: "{{ admin_user }} ALL=(ALL) {{ 'NOPASSWD:' if sudo_nopasswd else '' }}ALL\n"
         owner: root
         group: root
         mode: "0440"
         validate: "visudo -cf %s"
+        content: |
+          # Sudoers configuration for {{ admin_user }}
+          Defaults:{{ admin_user }} timestamp_timeout={{ sudoers_timeout_minutes }}
+          Defaults:{{ admin_user }} log_year, logfile="/var/log/sudo.log"
+          {{ admin_user }} ALL=(ALL) {{ 'NOPASSWD:' if sudo_nopasswd else '' }}ALL
       tags:
         - sudo
         - security
 
-    - name: Deploy developer shell environment aliases
+    - name: Deploy productive shell environment aliases and prompt profile
       blockinfile:
         path: "/home/{{ admin_user }}/.bashrc"
-        marker: "# {mark} ANSIBLE MANAGED DEVOPS ALIASES"
+        marker: "# {mark} ANSIBLE MANAGED DEVOPS PROFILE"
         block: |
+          # Security umask
+          umask 027
+
+          # History tuning
+          HISTCONTROL=ignoredups:erasedups
+          HISTSIZE=10000
+          HISTFILESIZE=20000
+
+          # Navigation and operational aliases
           alias ll='ls -alF --color=auto'
           alias gs='git status'
+          alias gd='git diff'
           alias dps='docker ps --format "table {{'{{'}}.Names{{'}}'}}\t{{'{{'}}.Status{{'}}'}}\t{{'{{'}}.Ports{{'}}'}}"'
+          alias k='kubectl'
+          alias tf='terraform'
           export EDITOR=vim
+
+          # Colorized PS1 prompt
+          PS1='\[\e[01;32m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\$ '
       tags:
         - environment
+        - shell
 
-    - name: Verify user account creation
+    - name: Verify user account details from passwd database
       getent:
         database: passwd
         key: "{{ admin_user }}"
@@ -94,8 +170,25 @@
       tags:
         - verify
 
-    - name: Output user configuration status
-      debug:
-        msg: "User '{{ admin_user }}' successfully provisioned with UID {{ user_info.ansible_facts.getent_passwd[admin_user][1] }} and shell {{ user_info.ansible_facts.getent_passwd[admin_user][5] }}."
+    - name: Audit user group memberships
+      command: "id {{ admin_user }}"
+      register: id_output
+      changed_when: false
       tags:
         - verify
+
+    - name: Display DevOps Provisioning Audit Summary
+      debug:
+        msg:
+          - "================ DEVOPS USER AUDIT ================"
+          - "Username        : {{ admin_user }}"
+          - "UID / GID       : {{ user_info.ansible_facts.getent_passwd[admin_user][1] }} / {{ user_info.ansible_facts.getent_passwd[admin_user][2] }}"
+          - "Home Directory  : {{ user_info.ansible_facts.getent_passwd[admin_user][4] }}"
+          - "Shell           : {{ user_info.ansible_facts.getent_passwd[admin_user][5] }}"
+          - "Group Access    : {{ id_output.stdout }}"
+          - "Password Max Age: {{ password_max_age_days }} days"
+          - "Sudo Timeout    : {{ sudoers_timeout_minutes }} min"
+          - "==================================================="
+      tags:
+        - verify
+        - report
