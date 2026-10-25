@@ -1,7 +1,8 @@
 ---
-- name: Install and Configure Enterprise RabbitMQ Message Broker
+- name: Enterprise RabbitMQ Message Broker Architecture, HA Policies & Telemetry Hardening
   hosts: message_broker
   become: yes
+  gather_facts: yes
 
   vars:
     rabbitmq_service_name: "rabbitmq-server"
@@ -12,7 +13,10 @@
     rabbitmq_vhost: "/production"
     rabbitmq_amqp_port: 5672
     rabbitmq_management_port: 15672
+    rabbitmq_prometheus_port: 15692
     vm_memory_high_watermark: "0.4"
+    disk_free_limit_relative: "1.5"
+    erlang_cookie: "SECURE_ENTERPRISE_RABBITMQ_COOKIE_2026"
     erlang_packages:
       - erlang-base
       - erlang-asn1
@@ -29,60 +33,103 @@
       - erlang-xmerl
 
   tasks:
-
-    - name: Install Erlang Dependencies and Prerequisites
+    - name: Install Erlang dependencies and prerequisites
       apt:
-        name: "{{ item }}"
+        name:
+          - apt-transport-https
+          - curl
+          - gnupg
+          - lsb-release
         state: present
         update_cache: yes
-      loop:
-        - apt-transport-https
-        - curl
-        - gnupg
-        - lsb-release
-        - "{{ erlang_packages }}"
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
 
-    - name: Install RabbitMQ Server
+    - name: Install Erlang OTP core platform components
+      apt:
+        name: "{{ erlang_packages }}"
+        state: present
+      tags:
+        - erlang
+
+    - name: Install RabbitMQ Server engine
       apt:
         name: rabbitmq-server
         state: present
         update_cache: yes
+      tags:
+        - install
+        - rabbitmq
 
-    - name: Ensure RabbitMQ Service is Running and Enabled
-      service:
-        name: "{{ rabbitmq_service_name }}"
-        state: started
-        enabled: yes
-
-    - name: Enable RabbitMQ Management Web Plugin
-      rabbitmq_plugin:
-        names:
-          - rabbitmq_management
-          - rabbitmq_prometheus
-        state: enabled
+    - name: Configure secure synchronized Erlang cookie across cluster nodes
+      copy:
+        dest: /var/lib/rabbitmq/.erlang.cookie
+        content: "{{ erlang_cookie }}"
+        owner: rabbitmq
+        group: rabbitmq
+        mode: "0400"
       notify: Restart RabbitMQ
+      tags:
+        - cluster
+        - security
 
-    - name: Configure RabbitMQ Resource Limits and Memory Watermark
+    - name: Deploy enterprise RabbitMQ configuration (rabbitmq.conf)
       copy:
         dest: /etc/rabbitmq/rabbitmq.conf
         owner: rabbitmq
         group: rabbitmq
         mode: "0644"
         content: |
-          # RabbitMQ Enterprise Configuration
-          listeners.tcp.default = 5672
-          management.tcp.port = 15672
+          # Enterprise RabbitMQ Engine Tuning
+          listeners.tcp.default = {{ rabbitmq_amqp_port }}
+          management.tcp.port = {{ rabbitmq_management_port }}
+          prometheus.tcp.port = {{ rabbitmq_prometheus_port }}
+
+          # Resource thresholds
           vm_memory_high_watermark.relative = {{ vm_memory_high_watermark }}
-          disk_free_limit.relative = 1.5
+          disk_free_limit.relative = {{ disk_free_limit_relative }}
+
+          # Connection and heartbeat tuning
+          heartbeat = 60
+          tcp_listen_options.backlog = 4096
+          tcp_listen_options.nodelay = true
+
+          # Telemetry and logging
           log.file.level = info
       notify: Restart RabbitMQ
+      tags:
+        - config
 
-    - name: Create Production Virtual Host
+    - name: Ensure RabbitMQ service is started and enabled on boot
+      service:
+        name: "{{ rabbitmq_service_name }}"
+        state: started
+        enabled: yes
+      tags:
+        - service
+
+    - name: Enable RabbitMQ Management and Prometheus plugins
+      rabbitmq_plugin:
+        names:
+          - rabbitmq_management
+          - rabbitmq_prometheus
+        state: enabled
+      notify: Restart RabbitMQ
+      tags:
+        - plugins
+
+    - name: Flush handlers to guarantee active plugins and configs
+      meta: flush_handlers
+
+    - name: Create production isolated Virtual Host
       rabbitmq_vhost:
         name: "{{ rabbitmq_vhost }}"
         state: present
+      tags:
+        - vhost
 
-    - name: Provision RabbitMQ Administrator User
+    - name: Provision RabbitMQ administrator user account
       rabbitmq_user:
         user: "{{ rabbitmq_admin_user }}"
         password: "{{ rabbitmq_admin_password }}"
@@ -93,8 +140,11 @@
         read_priv: ".*"
         write_priv: ".*"
         state: present
+      tags:
+        - security
+        - users
 
-    - name: Provision Dedicated Application Worker User
+    - name: Provision dedicated application worker user
       rabbitmq_user:
         user: "{{ rabbitmq_app_user }}"
         password: "{{ rabbitmq_app_password }}"
@@ -105,13 +155,43 @@
         read_priv: ".*"
         write_priv: ".*"
         state: present
+      tags:
+        - security
+        - users
 
-    - name: Delete Default Guest User for Security Hardening
+    - name: Delete default guest user account for security hardening
       rabbitmq_user:
         user: guest
         state: absent
+      tags:
+        - security
 
-    - name: Configure UFW Rules for AMQP and Management Console
+    - name: Configure High-Availability (HA) mirroring policy for queues
+      rabbitmq_policy:
+        name: "ha-all-queues"
+        pattern: "^ha\\."
+        vhost: "{{ rabbitmq_vhost }}"
+        tags:
+          ha-mode: "all"
+          ha-sync-mode: "automatic"
+        state: present
+      tags:
+        - policy
+        - ha
+
+    - name: Configure Dead-Letter-Exchange (DLX) retry policy
+      rabbitmq_policy:
+        name: "dlx-retry-policy"
+        pattern: "^work\\."
+        vhost: "{{ rabbitmq_vhost }}"
+        tags:
+          dead-letter-exchange: "amq.direct"
+          dead-letter-routing-key: "dlx"
+        state: present
+      tags:
+        - policy
+
+    - name: Configure UFW firewall rules for AMQP, Management UI, and Metrics
       ufw:
         rule: allow
         port: "{{ item }}"
@@ -119,10 +199,45 @@
       loop:
         - "{{ rabbitmq_amqp_port }}"
         - "{{ rabbitmq_management_port }}"
+        - "{{ rabbitmq_prometheus_port }}"
       ignore_errors: yes
+      tags:
+        - firewall
+
+    - name: Verify cluster node status via rabbitmqctl
+      command: rabbitmqctl status --formatter json
+      register: cluster_status_json
+      changed_when: false
+      tags:
+        - verify
+
+    - name: Verify Prometheus metrics endpoint reachability
+      uri:
+        url: "http://127.0.0.1:{{ rabbitmq_prometheus_port }}/metrics"
+        status_code: 200
+        return_content: no
+      register: prom_metrics_check
+      retries: 3
+      delay: 2
+      tags:
+        - verify
+
+    - name: Display RabbitMQ Enterprise Cluster & Health Status
+      debug:
+        msg:
+          - "================ RABBITMQ CLUSTER SUMMARY ================"
+          - "AMQP Port        : {{ rabbitmq_amqp_port }}"
+          - "Management UI    : http://127.0.0.1:{{ rabbitmq_management_port }}"
+          - "Prometheus Scrape: http://127.0.0.1:{{ rabbitmq_prometheus_port }}/metrics"
+          - "Virtual Host     : {{ rabbitmq_vhost }}"
+          - "HA Mirroring     : Active (pattern: ^ha., mode: all)"
+          - "Metrics Status   : Response code {{ prom_metrics_check.status }}"
+          - "============================================================"
+      tags:
+        - verify
+        - report
 
   handlers:
-
     - name: Restart RabbitMQ
       service:
         name: "{{ rabbitmq_service_name }}"
