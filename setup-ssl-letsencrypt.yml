@@ -1,68 +1,190 @@
 ---
-- name: Automate SSL/TLS Certificate Provisioning with Let's Encrypt Certbot
+- name: Enterprise SSL/TLS Certificate Provisioning & Lifecycle Automation
   hosts: web
   become: yes
+  gather_facts: yes
 
   vars:
     certbot_admin_email: "admin@example.com"
     ssl_domain_name: "example.com"
+    ssl_webroot_dir: "/var/www/letsencrypt"
     ssl_dhparam_path: "/etc/ssl/certs/dhparam.pem"
+    ssl_dhparam_bits: 2048
     certbot_auto_renew_hour: "3"
     certbot_auto_renew_minute: "15"
+    verification_mode: "webroot" # Options: webroot, standalone
+    enable_hsts: true
+    hsts_max_age_seconds: 31536000
 
   tasks:
-
-    - name: Install Certbot and Web Server Plugins
+    - name: Install Certbot, Web Server Connectors, and Cryptographic Tooling
       apt:
         name:
           - certbot
           - python3-certbot-nginx
           - python3-certbot-apache
           - openssl
+          - ca-certificates
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - install
+        - packages
 
-    - name: Create Strong Diffie-Hellman Parameters (2048-bit)
-      command: openssl dhparam -out {{ ssl_dhparam_path }} 2048
+    - name: Create ACME Challenge Webroot Directory
+      file:
+        path: "{{ ssl_webroot_dir }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+      tags:
+        - filesystem
+        - acme
+
+    - name: Generate Strong Diffie-Hellman Parameters File ({{ ssl_dhparam_bits }}-bit)
+      command: "openssl dhparam -out {{ ssl_dhparam_path }} {{ ssl_dhparam_bits }}"
       args:
         creates: "{{ ssl_dhparam_path }}"
+      tags:
+        - crypto
+        - dhparam
 
-    - name: Set Secure Permissions on DH Parameters File
+    - name: Set Secure File Permissions on DH Parameters File
       file:
         path: "{{ ssl_dhparam_path }}"
         mode: "0644"
         owner: root
         group: root
+      tags:
+        - crypto
+        - security
 
-    - name: Request SSL/TLS Certificate in Standalone / Certonly Mode
+    - name: Deploy Standardized Nginx SSL Parameters Snippet
+      copy:
+        dest: /etc/nginx/snippets/ssl-params.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Enterprise TLS Profile & Cipher Hardening
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_prefer_server_ciphers on;
+          ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
+          ssl_dhparam {{ ssl_dhparam_path }};
+          ssl_session_timeout 1d;
+          ssl_session_cache shared:SSL:10m;
+          ssl_session_tickets off;
+
+          # OCSP Stapling
+          ssl_stapling on;
+          ssl_stapling_verify on;
+          resolver 8.8.8.8 1.1.1.1 valid=300s;
+          resolver_timeout 5s;
+
+          # HSTS Security Header
+          {% if enable_hsts | bool %}
+          add_header Strict-Transport-Security "max-age={{ hsts_max_age_seconds }}; includeSubDomains; preload" always;
+          {% endif %}
+          add_header X-Content-Type-Options nosniff always;
+          add_header X-Frame-Options DENY always;
+      ignore_errors: yes
+      tags:
+        - nginx
+        - config
+
+    - name: Deploy Standardized Apache SSL Security Configuration
+      copy:
+        dest: /etc/apache2/conf-available/ssl-params.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Apache SSL Cipher Hardening
+          SSLCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+          SSLProxyCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+          SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+          SSLProxyProtocol all -SSLv3 -TLSv1 -TLSv1.1
+          SSLHonorCipherOrder on
+          SSLSessionTickets off
+
+          SSLOpenSSLConfCmd DHParameters {{ ssl_dhparam_path }}
+      ignore_errors: yes
+      tags:
+        - apache
+        - config
+
+    - name: Request SSL/TLS Certificate in Webroot Mode
+      command: >
+        certbot certonly --webroot -w {{ ssl_webroot_dir }}
+        --non-interactive --agree-tos
+        --email {{ certbot_admin_email }}
+        -d {{ ssl_domain_name }}
+      args:
+        creates: "/etc/letsencrypt/live/{{ ssl_domain_name }}/fullchain.pem"
+      when: verification_mode == "webroot"
+      register: certbot_webroot_output
+      ignore_errors: yes
+      tags:
+        - certificate
+
+    - name: Request SSL/TLS Certificate in Standalone Mode
       command: >
         certbot certonly --standalone --non-interactive --agree-tos
         --email {{ certbot_admin_email }}
         -d {{ ssl_domain_name }}
       args:
         creates: "/etc/letsencrypt/live/{{ ssl_domain_name }}/fullchain.pem"
-      register: certbot_output
+      when: verification_mode == "standalone"
+      register: certbot_standalone_output
       ignore_errors: yes
+      tags:
+        - certificate
 
-    - name: Display Certbot Certificate Result
-      debug:
-        msg: "{{ certbot_output.stdout_lines | default('Certificate already generated or simulated.') }}"
-
-    - name: Schedule Bi-Weekly Automated SSL Renewal Cron Job
+    - name: Schedule Automated SSL Renewal Cron Job with Service Hooks
       cron:
-        name: "Let's Encrypt Certificate Auto Renewal"
+        name: "Let's Encrypt Certificate Auto Renewal Engine"
         minute: "{{ certbot_auto_renew_minute }}"
         hour: "{{ certbot_auto_renew_hour }}"
         weekday: "1,4"
-        job: "certbot renew --quiet --no-self-upgrade --post-hook 'systemctl reload nginx || systemctl reload apache2'"
+        job: "certbot renew --quiet --no-self-upgrade --deploy-hook 'systemctl reload nginx 2>/dev/null || systemctl reload apache2 2>/dev/null || true'"
         user: root
+        state: present
+      tags:
+        - cron
+        - renewal
 
-    - name: Verify Certbot Renewal Timer or Service State
-      command: certbot renew --dry-run
-      register: certbot_dry_run
-      changed_when: false
+    - name: Ensure Certbot Systemd Renewal Timer is Active
+      systemd:
+        name: certbot.timer
+        state: started
+        enabled: yes
       ignore_errors: yes
+      tags:
+        - systemd
+        - timer
 
-    - name: Show Dry Run Renewal Status
+    - name: Inspect Generated or Existing Certificate Validity
+      command: "openssl x509 -in /etc/letsencrypt/live/{{ ssl_domain_name }}/fullchain.pem -noout -subject -dates"
+      register: cert_inspection
+      changed_when: false
+      failed_when: false
+      tags:
+        - audit
+        - verify
+
+    - name: Display Certificate Lifecycle & TLS Summary
       debug:
-        msg: "{{ certbot_dry_run.stdout_lines | default(['Dry run skipped']) }}"
+        msg:
+          - "================ SSL/TLS LIFECYCLE SUMMARY ================"
+          - "Domain Target    : {{ ssl_domain_name }}"
+          - "Contact Email    : {{ certbot_admin_email }}"
+          - "Verification Mode: {{ verification_mode }}"
+          - "DH Params Bits   : {{ ssl_dhparam_bits }}-bit (Path: {{ ssl_dhparam_path }})"
+          - "Auto-Renew Cron  : Active (Days 1,4 at {{ certbot_auto_renew_hour }}:{{ certbot_auto_renew_minute }})"
+          - "Certificate Meta : {{ cert_inspection.stdout_lines | default(['No live certificate found yet (simulation/pre-provisioned)']) }}"
+          - "============================================================"
+      tags:
+        - verify
+        - report
