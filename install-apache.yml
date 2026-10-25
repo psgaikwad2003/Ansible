@@ -1,5 +1,5 @@
 ---
-- name: Enterprise Apache HTTP Web Server Deployment & Security Hardening
+- name: Enterprise Apache HTTP Web Server Architecture, MPM Event Tuning & Security Hardening
   hosts: web
   become: yes
   gather_facts: yes
@@ -8,20 +8,30 @@
     apache_port: 80
     apache_server_admin: "webmaster@example.com"
     apache_doc_root: /var/www/html
+    apache_mpm_start_servers: 4
+    apache_mpm_server_limit: 16
+    apache_mpm_max_request_workers: 400
+    apache_mpm_threads_per_child: 25
+    apache_mpm_min_spare_threads: 75
+    apache_mpm_max_spare_threads: 250
     apache_modules:
+      - mpm_event
       - rewrite
       - headers
       - ssl
       - deflate
       - status
+      - http2
+      - filter
 
   tasks:
-    - name: Install Apache web server and utilities
+    - name: Install Apache web server, utilities, and diagnostics tools
       apt:
         name:
           - apache2
           - apache2-utils
           - curl
+          - libcap2-bin
         state: present
         update_cache: yes
         cache_valid_time: 3600
@@ -29,7 +39,7 @@
         - install
         - apache
 
-    - name: Enable required Apache modules
+    - name: Enable high-performance and security Apache modules
       command: "a2enmod {{ item }}"
       loop: "{{ apache_modules }}"
       register: a2enmod_res
@@ -38,25 +48,57 @@
       tags:
         - modules
 
-    - name: Configure Apache server information disclosure hardening
+    - name: Deploy tuned MPM Event concurrency configuration
+      copy:
+        dest: /etc/apache2/mods-available/mpm_event.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          <IfModule mpm_event_module>
+              StartServers              {{ apache_mpm_start_servers }}
+              ServerLimit               {{ apache_mpm_server_limit }}
+              MinSpareThreads           {{ apache_mpm_min_spare_threads }}
+              MaxSpareThreads           {{ apache_mpm_max_spare_threads }}
+              ThreadLimit               64
+              ThreadsPerChild           {{ apache_mpm_threads_per_child }}
+              MaxRequestWorkers         {{ apache_mpm_max_request_workers }}
+              MaxConnectionsPerChild    5000
+              AsyncRequestWorkerFactor  2
+          </IfModule>
+      notify: Restart Apache
+      tags:
+        - performance
+        - mpm
+
+    - name: Deploy enterprise security hardening directives
       copy:
         dest: /etc/apache2/conf-available/security-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
         content: |
-          # Security Hardening Directives
+          # Information Disclosure Prevention
           ServerTokens Prod
           ServerSignature Off
           TraceEnable Off
           FileETag None
 
-          # Global Clickjacking and Content-Type Protection
+          # Global Defensive HTTP Security Headers
           <IfModule mod_headers.c>
               Header always set X-Frame-Options "SAMEORIGIN"
               Header always set X-Content-Type-Options "nosniff"
               Header always set X-XSS-Protection "1; mode=block"
+              Header always set Referrer-Policy "strict-origin-when-cross-origin"
+              Header always set Permissions-Policy "geolocation=(), microphone=(), camera=()"
           </IfModule>
-        owner: root
-        group: root
-        mode: "0644"
+
+          # Restrict HTTP request methods to GET, POST, HEAD, OPTIONS
+          <Location "/">
+              <LimitExcept GET POST HEAD OPTIONS>
+                  Require all denied
+              </LimitExcept>
+          </Location>
       notify: Reload Apache
       tags:
         - security
@@ -71,17 +113,55 @@
         - security
         - config
 
-    - name: Deploy custom Apache VirtualHost configuration
+    - name: Create custom error documents directory
+      file:
+        path: "{{ apache_doc_root }}/errors"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags:
+        - filesystem
+
+    - name: Deploy custom branded error pages
+      copy:
+        dest: "{{ apache_doc_root }}/errors/{{ item.code }}.html"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          <!DOCTYPE html>
+          <html><head><title>{{ item.code }} {{ item.title }}</title></head>
+          <body style="font-family:sans-serif;text-align:center;padding:60px;background:#0f172a;color:#f8fafc;">
+          <h1 style="color:#ef4444;font-size:3rem;margin-bottom:0.5rem;">{{ item.code }}</h1>
+          <h2 style="margin-top:0;">{{ item.title }}</h2>
+          <p style="color:#94a3b8;">{{ item.description }}</p>
+          </body></html>
+      loop:
+        - { code: "403", title: "Forbidden", description: "Access to this resource is denied by server security policy." }
+        - { code: "404", title: "Not Found", description: "The requested path could not be located on this web node." }
+        - { code: "500", title: "Internal Server Error", description: "The web node encountered an unexpected error processing your request." }
+        - { code: "502", title: "Bad Gateway", description: "Upstream application service is temporarily unreachable." }
+        - { code: "503", title: "Service Unavailable", description: "Server is currently experiencing maintenance or resource saturation." }
+      tags:
+        - errors
+
+    - name: Deploy custom Apache VirtualHost configuration with HTTP/2
       copy:
         dest: /etc/apache2/sites-available/000-default.conf
+        owner: root
+        group: root
+        mode: "0644"
         content: |
           <VirtualHost *:{{ apache_port }}>
               ServerAdmin {{ apache_server_admin }}
               DocumentRoot {{ apache_doc_root }}
 
+              Protocols h2 http/1.1
+
               <Directory {{ apache_doc_root }}>
                   Options -Indexes +FollowSymLinks
-                  AllowOverride All
+                  AllowOverride None
                   Require all granted
               </Directory>
 
@@ -90,12 +170,22 @@
                   AddOutputFilterByType DEFLATE text/html text/plain text/xml text/css text/javascript application/javascript application/json
               </IfModule>
 
+              # Custom Error Documents
+              ErrorDocument 403 /errors/403.html
+              ErrorDocument 404 /errors/404.html
+              ErrorDocument 500 /errors/500.html
+              ErrorDocument 502 /errors/502.html
+              ErrorDocument 503 /errors/503.html
+
+              # Scoped Server Status for Monitoring
+              <Location "/server-status">
+                  SetHandler server-status
+                  Require local
+              </Location>
+
               ErrorLog ${APACHE_LOG_DIR}/error.log
               CustomLog ${APACHE_LOG_DIR}/access.log combined
           </VirtualHost>
-        owner: root
-        group: root
-        mode: "0644"
       notify: Reload Apache
       tags:
         - config
@@ -127,11 +217,19 @@
       tags:
         - verify
 
-    - name: Display Apache Deployment Summary
+    - name: Display Apache Architecture & Status Summary
       debug:
-        msg: "Apache HTTP Server is active and listening on port {{ apache_port }}. Status code: {{ http_response.status }}."
+        msg:
+          - "================ APACHE WEB SERVER SUMMARY ================"
+          - "Port             : {{ apache_port }}"
+          - "MPM Engine       : MPM Event (Max Workers: {{ apache_mpm_max_request_workers }})"
+          - "HTTP/2 Support   : Active (h2, http/1.1)"
+          - "Status Endpoint  : http://127.0.0.1:{{ apache_port }}/server-status"
+          - "HTTP Response    : Status code {{ http_response.status }}"
+          - "============================================================"
       tags:
         - verify
+        - report
 
   handlers:
     - name: Reload Apache
