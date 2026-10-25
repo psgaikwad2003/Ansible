@@ -1,23 +1,98 @@
 ---
-- name: Multi-Tier Project Directory & Storage Hierarchy Provisioning
+- name: Multi-Tier Project Storage Architecture & Directory Provisioning
   hosts: all
   become: yes
   gather_facts: yes
 
   vars:
     project_base_dir: /opt/project
-    service_user: root
-    service_group: root
+    service_user: "apprunner"
+    service_group: "apprunner"
+    service_uid: 1060
+    service_gid: 1060
+    devops_group: "devops"
+    min_required_disk_gb: 2
+    enforce_posix_acls: true
     project_subdirs:
-      - { path: "bin", mode: "0750" }
-      - { path: "config", mode: "0750" }
-      - { path: "data", mode: "0755" }
-      - { path: "logs", mode: "0775" }
-      - { path: "backups", mode: "0700" }
-      - { path: "tmp", mode: "1777" }  # Sticky bit for shared temporary files
+      - path: "bin"
+        mode: "0750"
+        description: "Executables, CLI scripts, and operational helpers"
+      - path: "config"
+        mode: "0750"
+        description: "Application configuration files, profiles, and runtime flags"
+      - path: "secrets"
+        mode: "0700"
+        description: "API tokens, encryption keys, and TLS credentials"
+      - path: "data"
+        mode: "0755"
+        description: "Persistent database files and immutable state assets"
+      - path: "logs"
+        mode: "2775"
+        description: "Structured event logs with SGID bit for group write collaboration"
+      - path: "backups"
+        mode: "0700"
+        description: "Automated snapshot dumps, tar archives, and recovery points"
+      - path: "staging"
+        mode: "0750"
+        description: "Continuous integration build artifacts and uncompressed assets"
+      - path: "tmp"
+        mode: "1777"
+        description: "Ephemeral scratch pad with POSIX sticky bit security"
 
   tasks:
-    - name: Ensure root project directory exists
+    - name: Pre-flight check - verify sufficient free storage on target volume
+      set_fact:
+        target_mount: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | first }}"
+      tags:
+        - preflight
+        - storage
+
+    - name: Assert minimum available free disk space is satisfied
+      assert:
+        that:
+          - "(target_mount.size_available / 1024 / 1024 / 1024) >= min_required_disk_gb"
+        fail_msg: "Insufficient free disk space! Required: {{ min_required_disk_gb }} GB, Available: {{ (target_mount.size_available / 1024 / 1024 / 1024) | round(2) }} GB."
+        success_msg: "Disk space pre-flight check passed: {{ (target_mount.size_available / 1024 / 1024 / 1024) | round(2) }} GB free."
+      tags:
+        - preflight
+
+    - name: Install ACL support utilities for POSIX permissions
+      apt:
+        name:
+          - acl
+          - attr
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - packages
+        - acl
+
+    - name: Ensure dedicated application service group exists
+      group:
+        name: "{{ service_group }}"
+        gid: "{{ service_gid }}"
+        system: yes
+        state: present
+      tags:
+        - identity
+        - groups
+
+    - name: Ensure dedicated application service user exists
+      user:
+        name: "{{ service_user }}"
+        group: "{{ service_group }}"
+        uid: "{{ service_uid }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        home: "{{ project_base_dir }}"
+        create_home: no
+        state: present
+      tags:
+        - identity
+        - users
+
+    - name: Provision root project directory
       file:
         path: "{{ project_base_dir }}"
         state: directory
@@ -28,7 +103,7 @@
         - filesystem
         - directories
 
-    - name: Create structured application subdirectories
+    - name: Create structured multi-tier subdirectories
       file:
         path: "{{ project_base_dir }}/{{ item.path }}"
         state: directory
@@ -36,42 +111,76 @@
         group: "{{ service_group }}"
         mode: "{{ item.mode }}"
       loop: "{{ project_subdirs }}"
+      loop_control:
+        label: "{{ item.path }} (mode {{ item.mode }})"
       tags:
         - filesystem
         - directories
 
-    - name: Deploy directory manifest and usage documentation
+    - name: Deploy standardized .keep sentinel markers
       copy:
-        dest: "{{ project_base_dir }}/README.md"
+        dest: "{{ project_base_dir }}/{{ item.path }}/.keep"
         content: |
-          # Project Storage Hierarchy
-          - `bin/`: Executables, operational scripts, and helper binaries
-          - `config/`: Application configuration files and secrets
-          - `data/`: Persistent storage and application state
-          - `logs/`: Application and system event logs
-          - `backups/`: Local snapshot archives and recovery checkpoints
-          - `tmp/`: Ephemeral staging and temporary processing files
+          # Storage Tier: {{ item.path }}
+          # Description: {{ item.description }}
+          # Initialized by Ansible: {{ ansible_date_time.iso8601 }}
+        owner: "{{ service_user }}"
+        group: "{{ service_group }}"
+        mode: "0644"
+      loop: "{{ project_subdirs }}"
+      loop_control:
+        label: "{{ item.path }}/.keep"
+      tags:
+        - filesystem
+        - sentinels
 
-          Managed by Ansible on {{ ansible_date_time.iso8601 }}.
+    - name: Apply POSIX default ACLs for DevOps collaboration on logs directory
+      shell: "setfacl -d -m g:{{ service_group }}:rwx {{ project_base_dir }}/logs"
+      when: enforce_posix_acls | bool
+      failed_when: false
+      tags:
+        - filesystem
+        - acl
+
+    - name: Generate project storage manifest documentation
+      copy:
+        dest: "{{ project_base_dir }}/STORAGE_MANIFEST.md"
+        content: |
+          # Enterprise Storage & Hierarchy Manifest
+
+          This server directory hierarchy is automatically orchestrated via Ansible infrastructure-as-code.
+
+          | Subdirectory | Access Mode | Purpose & Retention Policy |
+          | :--- | :--- | :--- |
+          {% for tier in project_subdirs %}
+          | `{{ tier.path }}/` | `{{ tier.mode }}` | {{ tier.description }} |
+          {% endfor %}
+
+          ---
+          - **Base Path**: `{{ project_base_dir }}`
+          - **Primary Owner**: `{{ service_user }}:{{ service_group }}` (UID {{ service_uid }} / GID {{ service_gid }})
+          - **Host Target**: `{{ ansible_hostname }} ({{ ansible_default_ipv4.address | default('N/A') }})`
+          - **Provisioned On**: `{{ ansible_date_time.iso8601 }}`
         owner: "{{ service_user }}"
         group: "{{ service_group }}"
         mode: "0644"
       tags:
         - documentation
 
-    - name: Audit directory creation status
+    - name: Audit status and attributes of provisioned directories
       stat:
         path: "{{ project_base_dir }}/{{ item.path }}"
       loop: "{{ project_subdirs }}"
-      register: dir_stats
+      register: dir_verification_results
       tags:
         - verify
 
-    - name: Display Directory Provisioning Summary
+    - name: Display Storage Provisioning Audit Summary
       debug:
-        msg: "Directory '{{ item.item.path }}' is present with mode {{ item.stat.mode }} owned by {{ item.stat.pw_name }}:{{ item.stat.gr_name }}."
-      loop: "{{ dir_stats.results }}"
+        msg: "Tier '{{ item.item.path }}' is verified with permissions {{ item.stat.mode }} owned by {{ item.stat.pw_name }}:{{ item.stat.gr_name }}."
+      loop: "{{ dir_verification_results.results }}"
       loop_control:
         label: "{{ item.item.path }}"
       tags:
         - verify
+        - report
