@@ -1,17 +1,22 @@
 ---
-- name: Install and Configure High-Availability HAProxy Load Balancer
+- name: Enterprise HAProxy High-Availability Load Balancer Deployment & Traffic Hardening
   hosts: loadbalancers
   become: yes
+  gather_facts: yes
 
   vars:
     haproxy_service_name: "haproxy"
     haproxy_port: 80
+    haproxy_https_port: 443
     haproxy_stats_port: 8404
     haproxy_stats_user: "admin"
-    haproxy_stats_password: "AdminSecureStatsPass@2026"
+    haproxy_stats_password: "{{ vault_haproxy_stats_password | default('AdminSecureStatsPass@2026') }}"
     max_connections: 50000
     backend_mode: "http"
     load_balance_algorithm: "roundrobin"
+    enable_rate_limiting: true
+    rate_limit_req_per_10s: 150
+    enable_security_headers: true
     backend_servers:
       - name: "app_node_01"
         address: "192.168.1.101"
@@ -40,8 +45,7 @@
         state: restarted
 
   tasks:
-
-    - name: Update APT Cache and Install Prerequisites
+    - name: Update APT Cache and Install Prerequisites, Loggers and Tools
       apt:
         name:
           - curl
@@ -49,13 +53,22 @@
           - rsyslog
           - socat
           - ufw
+          - jq
+          - logrotate
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
 
     - name: Install HAProxy Package
       apt:
         name: haproxy
         state: present
+      tags:
+        - packages
+        - install
 
     - name: Apply Kernel Sysctl Parameters for High-Throughput Load Balancing
       sysctl:
@@ -71,15 +84,18 @@
         - { name: 'net.ipv4.tcp_max_syn_backlog', value: '3240000' }
         - { name: 'net.ipv4.tcp_fin_timeout', value: '15' }
         - { name: 'net.ipv4.tcp_tw_reuse', value: '1' }
+      tags:
+        - sysctl
+        - network
 
-    - name: Configure Rsyslog for HAProxy Logging Isolation
+    - name: Configure Rsyslog for Isolated HAProxy Log Ingestion
       copy:
         dest: /etc/rsyslog.d/49-haproxy.conf
         owner: root
         group: root
         mode: "0644"
         content: |
-          # HAProxy isolated logging configuration
+          # HAProxy isolated syslog configuration
           $ModLoad imudp
           $UDPServerAddress 127.0.0.1
           $UDPServerRun 514
@@ -87,8 +103,10 @@
           local0.*    /var/log/haproxy.log
           & stop
       notify: Restart Rsyslog
+      tags:
+        - logging
 
-    - name: Ensure Dedicated HAProxy Log File Exists
+    - name: Ensure Dedicated HAProxy Log File Exists with Safe Permissions
       file:
         path: /var/log/haproxy.log
         state: touch
@@ -96,6 +114,34 @@
         group: adm
         mode: "0640"
       changed_when: false
+      tags:
+        - logging
+
+    - name: Create Custom HTTP Error Pages Directory
+      file:
+        path: /etc/haproxy/errors
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags:
+        - config
+
+    - name: Deploy Custom 429 Rate Limit Exceeded Error Template
+      copy:
+        dest: /etc/haproxy/errors/429.http
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          HTTP/1.0 429 Too Many Requests
+          Cache-Control: no-cache
+          Connection: close
+          Content-Type: application/json
+
+          {"error": "Too Many Requests", "status": 429, "message": "Request rate limit exceeded. Please throttle requests."}
+      tags:
+        - config
 
     - name: Backup Default HAProxy Configuration
       copy:
@@ -103,13 +149,16 @@
         dest: /etc/haproxy/haproxy.cfg.bak
         remote_src: yes
         force: no
+      tags:
+        - config
 
-    - name: Deploy Production HAProxy Configuration File
+    - name: Deploy Production HAProxy Configuration with Rate Limiting & Validation
       copy:
         dest: /etc/haproxy/haproxy.cfg
         owner: root
         group: root
         mode: "0644"
+        validate: 'haproxy -c -f %s'
         content: |
           # HAProxy Enterprise Production Configuration
           global
@@ -143,6 +192,7 @@
               errorfile 400 /etc/haproxy/errors/400.http
               errorfile 403 /etc/haproxy/errors/403.http
               errorfile 408 /etc/haproxy/errors/408.http
+              errorfile 429 /etc/haproxy/errors/429.http
               errorfile 500 /etc/haproxy/errors/500.http
               errorfile 502 /etc/haproxy/errors/502.http
               errorfile 503 /etc/haproxy/errors/503.http
@@ -153,6 +203,22 @@
               bind *:{{ haproxy_port }}
               mode http
               http-request set-header X-Forwarded-Proto http
+
+              {% if enable_rate_limiting | bool %}
+              # Anti-Abuse Stick Table Rate Limiting
+              stick-table type ip size 100k expire 30s store http_req_rate(10s)
+              http-request track-sc0 src
+              http-request deny deny_status 429 if { sc_http_req_rate(0) gt {{ rate_limit_req_per_10s }} }
+              {% endif %}
+
+              {% if enable_security_headers | bool %}
+              # Production HTTP Security Headers
+              http-response set-header X-Frame-Options "SAMEORIGIN"
+              http-response set-header X-Content-Type-Options "nosniff"
+              http-response set-header X-XSS-Protection "1; mode=block"
+              http-response set-header Referrer-Policy "strict-origin-when-cross-origin"
+              {% endif %}
+
               default_backend backend_cluster
 
           # Application Backend Cluster Pool
@@ -177,8 +243,9 @@
               stats admin if TRUE
               stats show-legends
               stats show-node
-        validate: 'haproxy -c -f %s'
       notify: Reload HAProxy
+      tags:
+        - config
 
     - name: Flush Handlers to Ensure HAProxy is Reconfigured
       meta: flush_handlers
@@ -188,17 +255,22 @@
         name: "{{ haproxy_service_name }}"
         state: started
         enabled: yes
+      tags:
+        - service
 
-    - name: Allow Traffic in UFW Firewall for HTTP and Stats
+    - name: Allow Traffic in UFW Firewall for HTTP, HTTPS, and Stats
       ufw:
         rule: allow
         port: "{{ item }}"
         proto: tcp
       loop:
         - "{{ haproxy_port }}"
+        - "{{ haproxy_https_port }}"
         - "{{ haproxy_stats_port }}"
-        - 443
       when: ansible_facts['os_family'] == "Debian"
+      ignore_errors: yes
+      tags:
+        - firewall
 
     - name: Verify HAProxy Stats Interface Availability
       uri:
@@ -212,12 +284,31 @@
       retries: 5
       delay: 2
       until: stats_response.status == 200
+      tags:
+        - verification
+
+    - name: Inspect HAProxy Runtime Process Statistics via Admin Socket
+      shell: "echo 'show info' | socat /run/haproxy/admin.sock stdio | grep -E '^(Name|Version|Uptime|Process_num|CurrConns|Maxconn):'"
+      register: socket_info
+      changed_when: false
+      ignore_errors: yes
+      tags:
+        - verification
 
     - name: Output HAProxy Load Balancer Deployment Status
       debug:
         msg:
+          - "=========================================================="
+          - "  HAPROXY HIGH-AVAILABILITY LOAD BALANCER SUMMARY         "
+          - "=========================================================="
           - "HAProxy Status         : Active and Running"
           - "HTTP Ingress Port      : {{ haproxy_port }}"
           - "Stats Dashboard URL    : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ haproxy_stats_port }}/"
           - "Stats Dashboard User   : {{ haproxy_stats_user }}"
+          - "Rate Limiting          : {{ 'Enabled (Max ' ~ rate_limit_req_per_10s ~ ' req/10s per IP)' if enable_rate_limiting else 'Disabled' }}"
+          - "Security Headers       : {{ 'Enforced' if enable_security_headers else 'Disabled' }}"
           - "Configured Backends    : {{ backend_servers | length }} nodes registered"
+          - "Socket Info            : {{ socket_info.stdout_lines | default(['Socket query unavailable']) }}"
+          - "=========================================================="
+      tags:
+        - summary
