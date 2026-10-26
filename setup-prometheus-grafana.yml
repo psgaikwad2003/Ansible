@@ -1,22 +1,29 @@
 ---
-- name: Deploy Prometheus Monitoring Server and Grafana Dashboards
+- name: Enterprise Prometheus Monitoring Server & Grafana Observability Platform
   hosts: monitoring_servers
   become: yes
+  gather_facts: yes
 
   vars:
     prometheus_version: "2.51.0"
+    prometheus_checksum: "sha256:0d53c7c2b3ab4208f2537f5d08fcf52eb71bbfffaad56645579ca36eec89e9f2"
     prometheus_user: "prometheus"
     prometheus_group: "prometheus"
     prometheus_config_dir: "/etc/prometheus"
     prometheus_data_dir: "/var/lib/prometheus"
     prometheus_port: 9090
     grafana_port: 3000
-    grafana_admin_password: "AdminGrafanaPass@2026"
+    grafana_admin_password: "{{ vault_grafana_admin_password | default('AdminGrafanaPass@2026') }}"
     scrape_interval: "15s"
     evaluation_interval: "15s"
     retention_time: "15d"
+    enable_alerting_rules: true
 
   handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
     - name: Restart Prometheus
       systemd:
         name: prometheus
@@ -30,8 +37,7 @@
         daemon_reload: yes
 
   tasks:
-
-    - name: Install System Prerequisites and Utility Tools
+    - name: Install System Prerequisites, Security Tools & Cryptography Libraries
       apt:
         name:
           - curl
@@ -41,14 +47,22 @@
           - apt-transport-https
           - software-properties-common
           - ufw
+          - jq
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
 
     - name: Create Dedicated Prometheus System Group
       group:
         name: "{{ prometheus_group }}"
         system: yes
         state: present
+      tags:
+        - security
+        - user
 
     - name: Create Dedicated Prometheus System User
       user:
@@ -58,45 +72,70 @@
         shell: /usr/sbin/nologin
         create_home: no
         state: present
+      tags:
+        - security
+        - user
 
-    - name: Create Prometheus Directory Structure
+    - name: Create Prometheus Directory Structure with Restricted Permissions
       file:
-        path: "{{ item }}"
+        path: "{{ item.path }}"
         state: directory
         owner: "{{ prometheus_user }}"
         group: "{{ prometheus_group }}"
-        mode: "0755"
+        mode: "{{ item.mode }}"
       loop:
-        - "{{ prometheus_config_dir }}"
-        - "{{ prometheus_config_dir }}/rules"
-        - "{{ prometheus_data_dir }}"
+        - { path: "{{ prometheus_config_dir }}", mode: "0755" }
+        - { path: "{{ prometheus_config_dir }}/rules", mode: "0755" }
+        - { path: "{{ prometheus_data_dir }}", mode: "0750" }
+      tags:
+        - directories
 
     - name: Check if Prometheus Binary Already Exists
       stat:
         path: /usr/local/bin/prometheus
       register: prometheus_binary_check
+      tags:
+        - download
 
-    - name: Download and Extract Prometheus Release Archive
+    - name: Download Prometheus Release Archive with Checksum Verification
+      get_url:
+        url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        checksum: "{{ prometheus_checksum | default(omit) }}"
+        mode: "0644"
+      when: not prometheus_binary_check.stat.exists
+      register: prometheus_download
+      until: prometheus_download is succeeded
+      retries: 3
+      delay: 5
+      tags:
+        - download
+
+    - name: Extract Prometheus Release Archive
       unarchive:
-        src: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
         dest: /tmp/
         remote_src: yes
       when: not prometheus_binary_check.stat.exists
+      tags:
+        - install
 
-    - name: Copy Prometheus and Promtool Binaries to /usr/local/bin
+    - name: Install Prometheus and Promtool Executables to System Bin
       copy:
         src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
         dest: "/usr/local/bin/{{ item }}"
-        owner: "{{ prometheus_user }}"
-        group: "{{ prometheus_group }}"
+        owner: root
+        group: root
         mode: "0755"
         remote_src: yes
       loop:
         - prometheus
         - promtool
       when: not prometheus_binary_check.stat.exists
+      tags:
+        - install
 
-    - name: Copy Prometheus Consoles and Libraries
+    - name: Install Prometheus Consoles and Libraries
       copy:
         src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
         dest: "{{ prometheus_config_dir }}/"
@@ -108,19 +147,25 @@
         - consoles
         - console_libraries
       when: not prometheus_binary_check.stat.exists
+      tags:
+        - install
 
-    - name: Remove Temporary Prometheus Extraction Files
+    - name: Remove Temporary Prometheus Archive and Extraction Files
       file:
-        path: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64"
+        path: "{{ item }}"
         state: absent
-      when: not prometheus_binary_check.stat.exists
+      loop:
+        - "/tmp/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        - "/tmp/prometheus-{{ prometheus_version }}.linux-amd64"
+      tags:
+        - cleanup
 
     - name: Deploy Production Prometheus Scrape Configuration
       copy:
         dest: "{{ prometheus_config_dir }}/prometheus.yml"
         owner: "{{ prometheus_user }}"
         group: "{{ prometheus_group }}"
-        mode: "0644"
+        mode: "0640"
         content: |
           # Prometheus Global and Scrape Configuration
           global:
@@ -133,15 +178,78 @@
 
           scrape_configs:
             - job_name: "prometheus"
+              metrics_path: "/metrics"
               static_configs:
                 - targets: ["localhost:{{ prometheus_port }}"]
 
             - job_name: "node_exporter"
+              metrics_path: "/metrics"
+              scrape_interval: 15s
               static_configs:
                 - targets: ["localhost:9100"]
       notify: Restart Prometheus
+      tags:
+        - config
 
-    - name: Deploy Prometheus Systemd Service Unit
+    - name: Deploy Enterprise Prometheus Alerting Rules
+      copy:
+        dest: "{{ prometheus_config_dir }}/rules/system_alerts.yml"
+        owner: "{{ prometheus_user }}"
+        group: "{{ prometheus_group }}"
+        mode: "0640"
+        content: |
+          # Prometheus Production System Alerting Rules
+          groups:
+            - name: infrastructure_alerts
+              rules:
+                - alert: InstanceDown
+                  expr: up == 0
+                  for: 1m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "Instance {{ $labels.instance }} is unreachable"
+                    description: "Target {{ $labels.instance }} of job {{ $labels.job }} has been down for over 1 minute."
+
+                - alert: HighCpuUsage
+                  expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "High CPU usage on {{ $labels.instance }}"
+                    description: "CPU utilization has exceeded 85% for more than 5 minutes."
+
+                - alert: DiskSpaceLow
+                  expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} * 100) < 15
+                  for: 3m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "Low root disk space on {{ $labels.instance }}"
+                    description: "Root partition free space is below 15%."
+
+                - alert: HighMemoryUsage
+                  expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "High memory utilization on {{ $labels.instance }}"
+                    description: "Memory utilization is above 90%."
+      when: enable_alerting_rules | bool
+      notify: Restart Prometheus
+      tags:
+        - config
+        - alerts
+
+    - name: Validate Prometheus Configuration and Alerting Rules with Promtool
+      command: /usr/local/bin/promtool check config {{ prometheus_config_dir }}/prometheus.yml
+      changed_when: false
+      tags:
+        - validation
+
+    - name: Deploy Hardened Prometheus Systemd Service Unit
       copy:
         dest: /etc/systemd/system/prometheus.service
         owner: root
@@ -170,28 +278,63 @@
           Restart=on-failure
           RestartSec=5s
           LimitNOFILE=65536
+          
+          # Systemd Security Hardening
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          ProtectControlGroups=true
+          ProtectKernelTunables=true
+          PrivateTmp=true
+          PrivateDevices=true
+          ReadWritePaths={{ prometheus_data_dir }}
 
           [Install]
           WantedBy=multi-user.target
-      notify: Restart Prometheus
+      notify:
+        - Reload Systemd
+        - Restart Prometheus
+      tags:
+        - systemd
+        - service
+
+    - name: Ensure Keyrings Directory Exists for Grafana
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags:
+        - grafana
+        - repo
 
     - name: Add Grafana Official GPG Key
       apt_key:
         url: https://apt.grafana.com/gpg.key
         state: present
         keyring: /etc/apt/keyrings/grafana.gpg
+      tags:
+        - grafana
+        - repo
 
     - name: Add Grafana Official APT Repository
       apt_repository:
         repo: "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main"
         state: present
         filename: grafana
+      tags:
+        - grafana
+        - repo
 
     - name: Install Grafana OSS Package
       apt:
         name: grafana
         state: present
         update_cache: yes
+      tags:
+        - grafana
+        - packages
 
     - name: Configure Grafana Server Settings
       ini_file:
@@ -208,14 +351,24 @@
         - { section: 'analytics', option: 'reporting_enabled', value: 'false' }
         - { section: 'analytics', option: 'check_for_updates', value: 'false' }
       notify: Restart Grafana
+      tags:
+        - grafana
+        - config
 
-    - name: Create Grafana Datasource Provisioning Directory
+    - name: Create Grafana Provisioning Directories
       file:
-        path: /etc/grafana/provisioning/datasources
+        path: "{{ item }}"
         state: directory
         owner: root
         group: grafana
         mode: "0750"
+      loop:
+        - /etc/grafana/provisioning/datasources
+        - /etc/grafana/provisioning/dashboards
+        - /var/lib/grafana/dashboards
+      tags:
+        - grafana
+        - provisioning
 
     - name: Auto-Provision Prometheus Datasource in Grafana
       copy:
@@ -236,6 +389,32 @@
                 timeInterval: 15s
                 httpMethod: POST
       notify: Restart Grafana
+      tags:
+        - grafana
+        - provisioning
+
+    - name: Auto-Provision Grafana Dashboards Provider
+      copy:
+        dest: /etc/grafana/provisioning/dashboards/provider.yaml
+        owner: root
+        group: grafana
+        mode: "0640"
+        content: |
+          apiVersion: 1
+          providers:
+            - name: 'Default Dashboards'
+              orgId: 1
+              folder: ''
+              type: file
+              disableDeletion: false
+              updateIntervalSeconds: 30
+              allowUiUpdates: true
+              options:
+                path: /var/lib/grafana/dashboards
+      notify: Restart Grafana
+      tags:
+        - grafana
+        - provisioning
 
     - name: Flush Handlers to Ensure Services are Started
       meta: flush_handlers
@@ -245,12 +424,16 @@
         name: prometheus
         state: started
         enabled: yes
+      tags:
+        - service
 
     - name: Ensure Grafana Service is Enabled and Running
       systemd:
         name: grafana-server
         state: started
         enabled: yes
+      tags:
+        - service
 
     - name: Allow Inbound Ports for Prometheus and Grafana in UFW
       ufw:
@@ -261,6 +444,9 @@
         - "{{ prometheus_port }}"
         - "{{ grafana_port }}"
       when: ansible_facts['os_family'] == "Debian"
+      ignore_errors: yes
+      tags:
+        - firewall
 
     - name: Verify Prometheus Health API Endpoint
       uri:
@@ -271,6 +457,8 @@
       retries: 5
       delay: 3
       until: prometheus_health.status == 200
+      tags:
+        - verification
 
     - name: Verify Grafana Health API Endpoint
       uri:
@@ -281,12 +469,23 @@
       retries: 5
       delay: 3
       until: grafana_health.status == 200
+      tags:
+        - verification
 
     - name: Output Provisioning Summary and Service Access URLs
       debug:
         msg:
-          - "Prometheus Web UI : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ prometheus_port }}"
-          - "Grafana Dashboard : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ grafana_port }}"
-          - "Grafana Username   : admin"
-          - "Prometheus Health  : {{ prometheus_health.status }}"
-          - "Grafana Health     : {{ grafana_health.status }}"
+          - "=========================================================="
+          - "  PROMETHEUS & GRAFANA OBSERVABILITY STACK SUMMARY        "
+          - "=========================================================="
+          - "Prometheus Web UI    : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ prometheus_port }}"
+          - "Grafana Dashboard    : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ grafana_port }}"
+          - "Grafana Username     : admin"
+          - "Prometheus Health    : {{ prometheus_health.status }}"
+          - "Grafana Health       : {{ grafana_health.status }}"
+          - "Alerting Rules       : {{ prometheus_config_dir }}/rules/system_alerts.yml"
+          - "Dashboard Provider   : /etc/grafana/provisioning/dashboards/provider.yaml"
+          - "Security Sandboxing  : ProtectSystem=strict, PrivateTmp=true, NoNewPrivileges=true"
+          - "=========================================================="
+      tags:
+        - summary
