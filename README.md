@@ -27,15 +27,15 @@ A curated collection of production-ready Ansible playbooks for Linux server admi
 | **Containers & CI/CD** | [`deploy_docker_app.yml`](deploy_docker_app.yml) | Install Docker engine and run standalone container |
 | | [`deploy-nodejs-app.yml`](deploy-nodejs-app.yml) | End-to-end Node.js deployment with NodeSource, Git clone, NPM install, and Systemd service |
 | | [`setup-docker-compose.yml`](setup-docker-compose.yml) | Deploy multi-container microservice stack (Nginx + Redis + volumes + bridge network) with Docker Compose |
-| | [`setup-github-actions-runner.yml`](setup-github-actions-runner.yml) | Automated GitHub Actions self-hosted runner provisioning with systemd daemon and toolchain |
-| | [`setup-k8s-containerd.yml`](setup-k8s-containerd.yml) | **(New)** Kubernetes cluster node preparation, swap disablement, CRI containerd runtime, and locked kubelet/kubeadm |
+| | [`setup-github-actions-runner.yml`](setup-github-actions-runner.yml) | Hardened GitHub Actions self-hosted CI/CD runner with release checksums, Node.js toolchain, workspace pruning, and systemd sandboxing |
+| | [`setup-k8s-containerd.yml`](setup-k8s-containerd.yml) | Kubernetes cluster node preparation, swap disablement, CRI containerd runtime, pause image pinning, sysctl inotify limits, and crictl integration |
 | **Monitoring & Backup** | [`setup-prometheus-grafana.yml`](setup-prometheus-grafana.yml) | **(New)** Full observability stack with Prometheus server, Grafana OSS, auto-provisioned datasources, and health APIs |
-| | [`setup-node-exporter.yml`](setup-node-exporter.yml) | Install Prometheus Node Exporter agent, systemd service, custom textfile collectors, and firewall rule |
-| | [`backup-database-s3.yml`](backup-database-s3.yml) | Automated multi-database (MySQL/PostgreSQL) backup engine with gzip, SHA256 checksums, S3 sync, and cron |
+| | [`setup-node-exporter.yml`](setup-node-exporter.yml) | Hardened Prometheus Node Exporter with systemd security isolation, TLS/basic-auth web config, custom textfile metric collector, and scrape verification |
+| | [`backup-database-s3.yml`](backup-database-s3.yml) | Multi-database (MySQL, PostgreSQL, MongoDB, Redis) backup engine with pre-flight storage assertion, S3 SSE encryption, flock locking, and logrotate |
 | | [`system-monitoring.yml`](system-monitoring.yml) | Comprehensive health check (CPU, RAM, disk, services, uptime) and file report generation |
 | **Security & Maintenance** | [`firewall.yml`](firewall.yml) | Configure and enable UFW firewall rules for web traffic |
 | | [`secure-ssh.yml`](secure-ssh.yml) | Harden OpenSSH daemon (disable root login, disable passwords, change port, fail2ban) |
-| | [`setup-vault-server.yml`](setup-vault-server.yml) | **(New)** HashiCorp Vault secrets management server with mlock memory security, file storage, and systemd daemon |
+| | [`setup-vault-server.yml`](setup-vault-server.yml) | HashiCorp Vault secrets management server with Raft HA / file storage, memory locking, Prometheus telemetry, audit logging, and CLI completions |
 | | [`manage-cron-jobs.yml`](manage-cron-jobs.yml) | Automate scheduled cron jobs (log rotation, backups, disk alert checks, temp cleanup) |
 | | [`system-patching-reboot.yml`](system-patching-reboot.yml) | Fleet OS patching, package cleanup, and controlled conditional reboot if required |
 
@@ -53,7 +53,7 @@ A curated collection of production-ready Ansible playbooks for Linux server admi
 
 ### 3. `setup-k8s-containerd.yml`
 - **Category**: Containers & Kubernetes
-- **Features**: Automates Kubernetes cluster node preparation. Permanently disables Linux swap (`swapoff -a` and `/etc/fstab` neutralization), loads essential kernel modules (`overlay`, `br_netfilter`), applies bridge sysctl networking flags, configures containerd with `SystemdCgroup = true`, adds the official Kubernetes package repository (`v1.30`), installs `kubelet`, `kubeadm`, `kubectl`, and locks versions with `dpkg_selections`.
+- **Features**: Automates Kubernetes cluster node preparation. Permanently disables Linux swap (`swapoff -a` and `/etc/fstab` neutralization), loads essential kernel modules (`overlay`, `br_netfilter`), applies bridge & inotify sysctl networking flags, configures containerd with `SystemdCgroup = true` and pinned pause images (`registry.k8s.io/pause:3.9`), provisions `/etc/crictl.yaml`, adds the official Kubernetes package repository (`v1.30`), installs `kubelet`, `kubeadm`, `kubectl`, and locks versions with `dpkg_selections`.
 
 ### 4. `setup-elasticsearch.yml`
 - **Category**: Databases & Search
@@ -61,7 +61,7 @@ A curated collection of production-ready Ansible playbooks for Linux server admi
 
 ### 5. `setup-vault-server.yml`
 - **Category**: Security & Secrets Management
-- **Features**: Installs HashiCorp Vault server from the official HashiCorp release repository. Establishes an unprivileged `vault` system user, assigns `cap_ipc_lock=+ep` to prevent secrets from swapping to disk, provisions file/raft storage with secure `0750` directory permissions, sets up systemd service unit with hardened security restrictions, and registers global `VAULT_ADDR` profile environments.
+- **Features**: Installs HashiCorp Vault server from the official HashiCorp release repository. Establishes an unprivileged `vault` system user, assigns `cap_ipc_lock=+ep` to prevent secrets from swapping to disk, provisions Raft HA or file storage with secure `0700` directory permissions, sets up systemd service unit with hardened security restrictions, enables Prometheus telemetry metrics, configures `/var/log/vault` audit logging with logrotate, and registers global `VAULT_ADDR` profile environments and shell completion.
 
 ---
 

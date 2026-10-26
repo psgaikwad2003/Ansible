@@ -1,18 +1,32 @@
 ---
-- name: Deploy and Configure HashiCorp Vault Secrets Management Server
+- name: Enterprise HashiCorp Vault Secrets Management Server Deployment & Hardening
   hosts: vault_servers
   become: yes
+  gather_facts: yes
 
   vars:
     vault_api_port: 8200
     vault_cluster_port: 8201
+    vault_storage_type: "raft" # options: raft, file
     vault_storage_dir: "/opt/vault/data"
     vault_config_dir: "/etc/vault.d"
+    vault_log_dir: "/var/log/vault"
     vault_user: "vault"
     vault_group: "vault"
+    vault_node_id: "{{ inventory_hostname | default('vault-node-01') }}"
+    vault_cluster_name: "enterprise-vault-cluster"
     hashicorp_keyring: "/etc/apt/keyrings/hashicorp-archive-keyring.gpg"
+    enable_ui: true
+    enable_telemetry: true
+    enable_tls: false
+    tls_cert_file: "/etc/vault.d/vault.crt"
+    tls_key_file: "/etc/vault.d/vault.key"
 
   handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
     - name: Restart Vault
       systemd:
         name: vault
@@ -20,8 +34,7 @@
         daemon_reload: yes
 
   tasks:
-
-    - name: Install Common Dependencies and Security Tools
+    - name: Install Common Dependencies, Security Tools, and Utilities
       apt:
         name:
           - curl
@@ -30,8 +43,13 @@
           - libcap2-bin
           - jq
           - ufw
+          - logrotate
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
 
     - name: Ensure Keyrings Directory Exists
       file:
@@ -40,30 +58,42 @@
         owner: root
         group: root
         mode: "0755"
+      tags:
+        - repo
 
     - name: Add HashiCorp Official GPG Key
       apt_key:
         url: https://apt.releases.hashicorp.com/gpg
         state: present
         keyring: "{{ hashicorp_keyring }}"
+      tags:
+        - repo
 
     - name: Add HashiCorp Official APT Repository
       apt_repository:
         repo: "deb [signed-by={{ hashicorp_keyring }}] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
         state: present
         filename: hashicorp
+      tags:
+        - repo
 
     - name: Install HashiCorp Vault Package
       apt:
         name: vault
         state: present
         update_cache: yes
+      tags:
+        - packages
+        - vault
 
     - name: Create Dedicated Vault System Group
       group:
         name: "{{ vault_group }}"
         system: yes
         state: present
+      tags:
+        - security
+        - user
 
     - name: Create Dedicated Vault System User
       user:
@@ -73,23 +103,32 @@
         shell: /usr/sbin/nologin
         create_home: no
         state: present
+      tags:
+        - security
+        - user
 
-    - name: Create Vault Storage and Configuration Directories
+    - name: Create Vault Storage, Config, and Audit Log Directories with Restricted Permissions
       file:
-        path: "{{ item }}"
+        path: "{{ item.path }}"
         state: directory
         owner: "{{ vault_user }}"
         group: "{{ vault_group }}"
-        mode: "0750"
+        mode: "{{ item.mode }}"
       loop:
-        - "{{ vault_config_dir }}"
-        - "{{ vault_storage_dir }}"
+        - { path: "{{ vault_config_dir }}", mode: "0750" }
+        - { path: "{{ vault_storage_dir }}", mode: "0700" }
+        - { path: "{{ vault_log_dir }}", mode: "0750" }
+      tags:
+        - directories
 
     - name: Grant IPC Lock Capability to Vault Binary (Prevent Swapping Secrets)
       capabilities:
         path: /usr/bin/vault
         capability: cap_ipc_lock=+ep
         state: present
+      tags:
+        - security
+        - capabilities
 
     - name: Deploy Production Vault HCL Configuration
       copy:
@@ -98,24 +137,51 @@
         group: "{{ vault_group }}"
         mode: "0640"
         content: |
-          # HashiCorp Vault Production Configuration
-          ui = true
+          # HashiCorp Vault Enterprise Production Configuration
+          ui = {{ enable_ui | lower }}
+          cluster_name = "{{ vault_cluster_name }}"
           disable_mlock = false
 
+          # Storage Engine Configuration
+          {% if vault_storage_type == 'raft' %}
+          storage "raft" {
+            path    = "{{ vault_storage_dir }}"
+            node_id = "{{ vault_node_id }}"
+          }
+          {% else %}
           storage "file" {
             path = "{{ vault_storage_dir }}"
           }
+          {% endif %}
 
+          # Listener Configuration
           listener "tcp" {
             address       = "0.0.0.0:{{ vault_api_port }}"
+            {% if enable_tls | bool %}
+            tls_disable   = 0
+            tls_cert_file = "{{ tls_cert_file }}"
+            tls_key_file  = "{{ tls_key_file }}"
+            tls_min_version = "tls12"
+            {% else %}
             tls_disable   = 1
+            {% endif %}
           }
 
-          api_addr     = "http://127.0.0.1:{{ vault_api_port }}"
-          cluster_addr = "http://127.0.0.1:{{ vault_cluster_port }}"
-      notify: Restart Vault
+          api_addr     = "http{% if enable_tls | bool %}s{% endif %}://{{ ansible_default_ipv4.address | default('127.0.0.1') }}:{{ vault_api_port }}"
+          cluster_addr = "http{% if enable_tls | bool %}s{% endif %}://{{ ansible_default_ipv4.address | default('127.0.0.1') }}:{{ vault_cluster_port }}"
 
-    - name: Deploy Vault Systemd Service Unit
+          {% if enable_telemetry | bool %}
+          # Prometheus Telemetry Metrics
+          telemetry {
+            prometheus_retention_time = "30s"
+            disable_hostname          = true
+          }
+          {% endif %}
+      notify: Restart Vault
+      tags:
+        - config
+
+    - name: Deploy Hardened Vault Systemd Service Unit
       copy:
         dest: /etc/systemd/system/vault.service
         owner: root
@@ -123,7 +189,7 @@
         mode: "0644"
         content: |
           [Unit]
-          Description="HashiCorp Vault - A tool for managing secrets"
+          Description=HashiCorp Vault - Enterprise Secrets Management
           Documentation=https://www.vaultproject.io/docs/
           Requires=network-online.target
           After=network-online.target
@@ -150,21 +216,54 @@
           TimeoutStopSec=30
           LimitNOFILE=65536
           LimitMEMLOCK=infinity
+          StandardOutput=journal
+          StandardError=journal
 
           [Install]
           WantedBy=multi-user.target
       notify: Restart Vault
+      tags:
+        - systemd
+        - service
 
-    - name: Set Global Environment Variable for Vault CLI
+    - name: Configure Dedicated Logrotate Policy for Vault Audit Logs
+      copy:
+        dest: /etc/logrotate.d/vault
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ vault_log_dir }}/*.log {
+              weekly
+              missingok
+              rotate 12
+              compress
+              delaycompress
+              notifempty
+              create 0640 {{ vault_user }} {{ vault_group }}
+              postrotate
+                  /bin/kill -HUP $(cat /var/run/vault/vault.pid 2>/dev/null) 2>/dev/null || true
+              endscript
+          }
+      tags:
+        - logrotate
+
+    - name: Set Global Profile Environment Variable for Vault CLI
       copy:
         dest: /etc/profile.d/vault.sh
         owner: root
         group: root
         mode: "0644"
         content: |
-          export VAULT_ADDR="http://127.0.0.1:{{ vault_api_port }}"
+          export VAULT_ADDR="http{% if enable_tls | bool %}s{% endif %}://127.0.0.1:{{ vault_api_port }}"
+          if command -v vault &> /dev/null; then
+            complete -C /usr/bin/vault vault
+          fi
+      tags:
+        - profile
+        - cli
 
-    - name: Flush Handlers to Ensure Vault is Started
+    - name: Flush Handlers to Restart Vault
       meta: flush_handlers
 
     - name: Ensure Vault Service is Started and Enabled
@@ -172,18 +271,28 @@
         name: vault
         state: started
         enabled: yes
+      tags:
+        - service
 
-    - name: Configure UFW Firewall Ingress for Vault API Port
+    - name: Configure UFW Firewall Ingress for Vault Ports
       ufw:
         rule: allow
-        port: "{{ vault_api_port }}"
+        port: "{{ item }}"
         proto: tcp
+        comment: "HashiCorp Vault Ports"
+      loop:
+        - "{{ vault_api_port }}"
+        - "{{ vault_cluster_port }}"
       when: ansible_facts['os_family'] == "Debian"
+      ignore_errors: yes
+      tags:
+        - firewall
 
     - name: Verify Vault Health / Status API Endpoint
       uri:
-        url: "http://127.0.0.1:{{ vault_api_port }}/v1/sys/health"
+        url: "http{% if enable_tls | bool %}s{% endif %}://127.0.0.1:{{ vault_api_port }}/v1/sys/health"
         method: GET
+        validate_certs: no
         status_code:
           - 200
           - 429
@@ -194,12 +303,23 @@
       register: vault_health
       retries: 5
       delay: 2
+      tags:
+        - verification
 
     - name: Output HashiCorp Vault Server Deployment Summary
       debug:
         msg:
+          - "=========================================================="
+          - "  HASHICORP VAULT SERVER DEPLOYMENT SUMMARY               "
+          - "=========================================================="
           - "Vault Status         : Started and Listening"
-          - "Vault API Endpoint   : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ vault_api_port }}"
-          - "Vault Web UI         : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ vault_api_port }}/ui"
-          - "Initialization Guide : Run 'vault operator init' on the node to initialize key shares"
-          - "Storage Engine       : File backend at {{ vault_storage_dir }}"
+          - "API Endpoint         : http{% if enable_tls | bool %}s{% endif %}://{{ ansible_default_ipv4.address | default('localhost') }}:{{ vault_api_port }}"
+          - "Web UI               : http{% if enable_tls | bool %}s{% endif %}://{{ ansible_default_ipv4.address | default('localhost') }}:{{ vault_api_port }}/ui"
+          - "Storage Engine       : {{ vault_storage_type | upper }} backend ({{ vault_storage_dir }})"
+          - "Telemetry Enabled    : {{ enable_telemetry }} (Prometheus metrics active)"
+          - "Initialization Guide : Run 'vault operator init' on the node to create root tokens"
+          - "Health HTTP Status   : {{ vault_health.status | default('N/A') }}"
+          - "Audit Log Directory  : {{ vault_log_dir }}"
+          - "=========================================================="
+      tags:
+        - summary
