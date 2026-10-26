@@ -1,31 +1,36 @@
 ---
-- name: Prepare Kubernetes Node Prerequisites and Install Containerd CRI
+- name: Enterprise Kubernetes Node Preparation & Hardened Containerd CRI Provisioning
   hosts: k8s_nodes
   become: yes
+  gather_facts: yes
 
   vars:
     k8s_major_minor: "v1.30"
+    k8s_pause_image: "registry.k8s.io/pause:3.9"
     containerd_config_dir: "/etc/containerd"
     containerd_config_file: "/etc/containerd/config.toml"
+    containerd_socket: "/run/containerd/containerd.sock"
     kubernetes_keyring: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
     docker_keyring: "/etc/apt/keyrings/docker.gpg"
+    node_ip: "{{ ansible_default_ipv4.address | default('127.0.0.1') }}"
 
   handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
     - name: Restart Containerd
       systemd:
         name: containerd
         state: restarted
-        daemon_reload: yes
 
     - name: Restart Kubelet
       systemd:
         name: kubelet
         state: restarted
-        daemon_reload: yes
 
   tasks:
-
-    - name: Install Common Dependencies and Utility Packages
+    - name: Install Common Dependencies, Networking Tools, and CRI Prerequisites
       apt:
         name:
           - apt-transport-https
@@ -37,20 +42,32 @@
           - socat
           - conntrack
           - ipset
+          - iptables
+          - ebtables
+          - ethtool
+          - jq
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
 
-    - name: Disable Swap at Runtime
+    - name: Disable Swap Immediately at Runtime
       command: swapoff -a
       changed_when: false
+      tags:
+        - swap
 
-    - name: Permanently Remove Swap Mount from /etc/fstab
+    - name: Permanently Remove Swap Mounts from /etc/fstab
       replace:
         path: /etc/fstab
         regexp: '^(\s*[^#\s]+\s+[^#\s]+\s+swap\s+.*)$'
         replace: '# \1'
+      tags:
+        - swap
 
-    - name: Ensure Kernel Modules Load on Boot for Container Runtime
+    - name: Configure Kernel Modules to Load on Boot
       copy:
         dest: /etc/modules-load.d/k8s.conf
         owner: root
@@ -59,16 +76,22 @@
         content: |
           overlay
           br_netfilter
+      tags:
+        - kernel
+        - modules
 
-    - name: Load Kernel Modules into Running Kernel
+    - name: Load Required Kernel Modules into Running Kernel
       modprobe:
         name: "{{ item }}"
         state: present
       loop:
         - overlay
         - br_netfilter
+      tags:
+        - kernel
+        - modules
 
-    - name: Apply Sysctl Network Parameters for Kubernetes CRI Networking
+    - name: Apply Enterprise Sysctl Parameters for Kubernetes CRI & Network Routing
       sysctl:
         name: "{{ item.name }}"
         value: "{{ item.value }}"
@@ -79,32 +102,49 @@
         - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
         - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
         - { name: 'net.ipv4.ip_forward', value: '1' }
+        - { name: 'fs.inotify.max_user_watches', value: '524288' }
+        - { name: 'fs.inotify.max_user_instances', value: '8192' }
+        - { name: 'fs.file-max', value: '2097152' }
+        - { name: 'net.core.somaxconn', value: '32768' }
+        - { name: 'net.ipv4.tcp_tw_reuse', value: '1' }
+      tags:
+        - sysctl
+        - network
 
-    - name: Ensure Keyrings Directory Exists
+    - name: Ensure APT Keyrings Directory Exists
       file:
         path: /etc/apt/keyrings
         state: directory
         owner: root
         group: root
         mode: "0755"
+      tags:
+        - repo
 
-    - name: Add Docker Official GPG Key for Containerd
+    - name: Add Docker Official GPG Key for Containerd Runtime
       apt_key:
         url: https://download.docker.com/linux/ubuntu/gpg
         state: present
         keyring: "{{ docker_keyring }}"
+      tags:
+        - repo
 
     - name: Add Docker APT Repository for Official Containerd
       apt_repository:
         repo: "deb [arch=amd64 signed-by={{ docker_keyring }}] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
         state: present
         filename: docker
+      tags:
+        - repo
 
-    - name: Install Containerd.io Runtime
+    - name: Install Containerd.io Runtime Package
       apt:
         name: containerd.io
         state: present
         update_cache: yes
+      tags:
+        - packages
+        - containerd
 
     - name: Ensure Containerd Configuration Directory Exists
       file:
@@ -113,11 +153,16 @@
         owner: root
         group: root
         mode: "0755"
+      tags:
+        - containerd
 
-    - name: Generate Default Containerd Configuration File
+    - name: Generate Baseline Default Containerd Configuration File
       shell: containerd config default > {{ containerd_config_file }}
       args:
         creates: "{{ containerd_config_file }}"
+      tags:
+        - containerd
+        - config
 
     - name: Configure Containerd to Use Systemd Cgroup Driver
       replace:
@@ -125,32 +170,72 @@
         regexp: '(\s*SystemdCgroup\s*=\s*)false'
         replace: '\1true'
       notify: Restart Containerd
+      tags:
+        - containerd
+        - config
 
-    - name: Flush Handlers to Ensure Containerd Restart
+    - name: Pin Kubernetes Pause Container Image in Containerd
+      replace:
+        path: "{{ containerd_config_file }}"
+        regexp: '(\s*sandbox_image\s*=\s*)"[^"]+"'
+        replace: '\1"{{ k8s_pause_image }}"'
+      notify: Restart Containerd
+      tags:
+        - containerd
+        - config
+
+    - name: Deploy Standard crictl Configuration File
+      copy:
+        dest: /etc/crictl.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          runtime-endpoint: unix://{{ containerd_socket }}
+          image-endpoint: unix://{{ containerd_socket }}
+          timeout: 10
+          debug: false
+          pull-image-on-create: false
+      tags:
+        - crictl
+
+    - name: Flush Handlers to Restart Containerd with New Configuration
       meta: flush_handlers
 
-    - name: Ensure Containerd Service is Enabled and Started
+    - name: Ensure Containerd Service is Enabled and Running
       systemd:
         name: containerd
         state: started
         enabled: yes
+      tags:
+        - containerd
+        - service
 
     - name: Download Kubernetes Official APT Key
       get_url:
         url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_major_minor }}/deb/Release.key"
         dest: /tmp/k8s-release.key
         mode: "0644"
+      tags:
+        - k8s
+        - repo
 
     - name: Convert and Store Kubernetes GPG Key in Keyring
       shell: "cat /tmp/k8s-release.key | gpg --dearmor --yes -o {{ kubernetes_keyring }}"
       args:
         creates: "{{ kubernetes_keyring }}"
+      tags:
+        - k8s
+        - repo
 
     - name: Add Kubernetes Official APT Repository
       apt_repository:
         repo: "deb [signed-by={{ kubernetes_keyring }}] https://pkgs.k8s.io/core:/stable:/{{ k8s_major_minor }}/deb/ /"
         state: present
         filename: kubernetes
+      tags:
+        - k8s
+        - repo
 
     - name: Install Kubernetes Node Packages (kubelet, kubeadm, kubectl)
       apt:
@@ -160,6 +245,9 @@
           - kubectl
         state: present
         update_cache: yes
+      tags:
+        - k8s
+        - packages
 
     - name: Lock Kubernetes Package Versions to Prevent Accidental Upgrades
       dpkg_selections:
@@ -169,24 +257,81 @@
         - kubelet
         - kubeadm
         - kubectl
+      tags:
+        - k8s
+        - packages
 
-    - name: Enable Kubelet Service
+    - name: Configure Kubelet Default Node IP and Systemd Flags
+      copy:
+        dest: /etc/default/kubelet
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          KUBELET_EXTRA_ARGS="--node-ip={{ node_ip }} --container-runtime-endpoint=unix://{{ containerd_socket }}"
+      notify: Restart Kubelet
+      tags:
+        - kubelet
+        - config
+
+    - name: Enable Kubelet Service on Boot
       systemd:
         name: kubelet
         enabled: yes
+      tags:
+        - kubelet
+        - service
 
-    - name: Verify Containerd Socket Exists
+    - name: Deploy Kubernetes Bash Autocompletion Profile
+      copy:
+        dest: /etc/profile.d/k8s-completion.sh
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          if command -v kubectl &> /dev/null; then
+            source <(kubectl completion bash)
+            alias k=kubectl
+            complete -o default -F __start_kubectl k
+          fi
+          if command -v crictl &> /dev/null; then
+            source <(crictl completion bash)
+          fi
+      tags:
+        - profile
+        - cli
+
+    - name: Verify Containerd Unix Socket Is Active
       stat:
-        path: /run/containerd/containerd.sock
+        path: "{{ containerd_socket }}"
       register: containerd_socket_stat
       failed_when: not containerd_socket_stat.stat.exists
+      tags:
+        - verification
+
+    - name: Verify CRI Runtime Readiness via crictl
+      command: crictl info
+      register: crictl_info_result
+      changed_when: false
+      failed_when: false
+      tags:
+        - verification
 
     - name: Output Kubernetes Node Preparation Summary
       debug:
         msg:
-          - "Container Runtime       : containerd.io (SystemdCgroup=true)"
-          - "CRI Socket Path         : unix:///run/containerd/containerd.sock"
-          - "Kubernetes Toolchain    : kubelet, kubeadm, kubectl ({{ k8s_major_minor }})"
-          - "Package Lock Status     : Locked on hold"
-          - "Swap Status             : Disabled"
-          - "Kernel Networking       : br_netfilter and overlay loaded"
+          - "=========================================================="
+          - "  KUBERNETES NODE & CONTAINERD CRI PROVISIONING SUMMARY   "
+          - "=========================================================="
+          - "Container Runtime       : containerd.io (SystemdCgroup = true)"
+          - "CRI Socket Path         : unix://{{ containerd_socket }}"
+          - "Pause Container Image   : {{ k8s_pause_image }}"
+          - "Kubernetes Release      : {{ k8s_major_minor }} (kubelet, kubeadm, kubectl)"
+          - "Package Lock State      : dpkg hold applied (prevent auto-upgrade)"
+          - "Swap State              : Disabled (swapoff -a + /etc/fstab commented)"
+          - "Kernel Networking       : br_netfilter & overlay active, ip_forward=1"
+          - "Sysctl Inotify Tuning   : max_user_watches=524288, max_user_instances=8192"
+          - "CLI Autocompletion      : Installed for kubectl & crictl (/etc/profile.d/k8s-completion.sh)"
+          - "=========================================================="
+      tags:
+        - summary
