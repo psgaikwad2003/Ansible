@@ -1,5 +1,5 @@
 ---
-- name: Enterprise System Health Diagnostics, Resource Telemetry & Health Audit Automation
+- name: Enterprise System Health Monitoring, Telemetry Auditing & Alert Dispatcher
   hosts: all
   become: yes
   gather_facts: yes
@@ -8,11 +8,14 @@
     disk_warning_threshold: 80
     disk_critical_threshold: 90
     memory_warning_threshold: 85
+    load_threshold_multiplier: 1.5
     report_dir: "/var/log/system-audits"
     report_retention_days: 14
+    alert_webhook_url: ""
+    enable_alert_notifications: true
 
   tasks:
-    - name: Gather comprehensive hardware and network facts
+    - name: Gather Comprehensive Hardware, Network, and Virtual Facts
       setup:
         gather_subset:
           - hardware
@@ -21,7 +24,7 @@
       tags:
         - facts
 
-    - name: Ensure system audit reports directory exists
+    - name: Ensure System Audit Reports Directory Exists
       file:
         path: "{{ report_dir }}"
         state: directory
@@ -31,7 +34,7 @@
       tags:
         - init
 
-    - name: Collect 1, 5, and 15-minute system load averages
+    - name: Collect 1, 5, and 15-Minute System Load Averages
       command: cat /proc/loadavg
       register: loadavg_raw
       changed_when: false
@@ -39,24 +42,40 @@
         - metrics
         - cpu
 
-    - name: Set parsed load average facts
+    - name: Set Parsed Load Average Facts
       set_fact:
         load_1m: "{{ loadavg_raw.stdout.split()[0] }}"
         load_5m: "{{ loadavg_raw.stdout.split()[1] }}"
         load_15m: "{{ loadavg_raw.stdout.split()[2] }}"
+        cpu_cores: "{{ ansible_processor_vcpus | default(ansible_processor_cores) | default(1) }}"
       tags:
         - metrics
         - cpu
 
-    - name: Calculate memory utilization percentage
+    - name: Calculate Memory and Swap Utilization Metrics
       set_fact:
         mem_used_mb: "{{ ansible_memtotal_mb - ansible_memfree_mb }}"
         mem_used_pct: "{{ (((ansible_memtotal_mb - ansible_memfree_mb) / ansible_memtotal_mb) * 100) | round(1) }}"
+        swap_used_mb: "{{ (ansible_swaptotal_mb | default(0)) - (ansible_swapfree_mb | default(0)) }}"
       tags:
         - metrics
         - memory
 
-    - name: Check for failed systemd service units
+    - name: Identify Top 5 CPU-Consuming Processes
+      shell: "ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | head -n 6"
+      register: top_cpu_processes
+      changed_when: false
+      tags:
+        - processes
+
+    - name: Identify Top 5 Memory-Consuming Processes
+      shell: "ps -eo pid,user,%cpu,%mem,comm --sort=-%mem | head -n 6"
+      register: top_mem_processes
+      changed_when: false
+      tags:
+        - processes
+
+    - name: Check for Failed Systemd Service Units
       command: systemctl --failed --no-legend
       register: failed_services
       changed_when: false
@@ -64,7 +83,15 @@
       tags:
         - services
 
-    - name: Count total running processes and zombie processes
+    - name: Audit Active Listening Network Ports
+      shell: "ss -tuln | awk 'NR>1 {print $1, $5}'"
+      register: listening_ports
+      changed_when: false
+      tags:
+        - network
+        - security
+
+    - name: Count Total Running Processes and Zombie Threads
       shell: |
         echo "total=$(ps -ef | wc -l)"
         echo "zombies=$(ps -eo stat | grep -c '^Z' || true)"
@@ -73,22 +100,29 @@
       tags:
         - processes
 
-    - name: Inspect root partition disk space usage
-      command: df -h /
-      register: root_disk_raw
+    - name: Inspect Root Partition Disk Space Usage Percentage
+      shell: "df / --output=pcent | tail -n 1 | tr -d ' %'"
+      register: root_disk_pct
       changed_when: false
       tags:
-        - metrics
         - disk
 
-    - name: Check whether system reboot is required
+    - name: Check Whether System Reboot is Required
       stat:
         path: /var/run/reboot-required
       register: reboot_flag
       tags:
         - status
 
-    - name: Test outbound Internet and DNS connectivity
+    - name: Check System NTP Time Synchronization Status
+      command: timedatectl status
+      register: ntp_status
+      changed_when: false
+      failed_when: false
+      tags:
+        - time
+
+    - name: Test Outbound Internet and DNS Connectivity
       command: ping -c 2 -W 3 1.1.1.1
       register: net_ping
       changed_when: false
@@ -96,27 +130,46 @@
       tags:
         - network
 
-    - name: Generate structured JSON system telemetry log
+    - name: Determine If Any Critical Thresholds Are Breached
+      set_fact:
+        is_disk_critical: "{{ root_disk_pct.stdout | int >= disk_critical_threshold }}"
+        is_disk_warning: "{{ root_disk_pct.stdout | int >= disk_warning_threshold }}"
+        is_memory_warning: "{{ mem_used_pct | float >= memory_warning_threshold }}"
+        is_load_high: "{{ load_1m | float > (cpu_cores | float * load_threshold_multiplier) }}"
+      tags:
+        - evaluation
+
+    - name: Generate Structured JSON System Telemetry Log
       copy:
         dest: "{{ report_dir }}/system_health_{{ ansible_date_time.date }}.json"
         content: |
           {
             "timestamp": "{{ ansible_date_time.iso8601 }}",
             "hostname": "{{ ansible_hostname }}",
+            "fqdn": "{{ ansible_fqdn }}",
             "os_distribution": "{{ ansible_distribution }} {{ ansible_distribution_version }}",
             "kernel_version": "{{ ansible_kernel }}",
             "uptime_seconds": {{ ansible_uptime_seconds }},
-            "cpu_cores": {{ ansible_processor_vcpus | default(ansible_processor_cores) }},
-            "load_averages": {
-              "1m": {{ load_1m }},
-              "5m": {{ load_5m }},
-              "15m": {{ load_15m }}
+            "cpu": {
+              "cores": {{ cpu_cores }},
+              "load_1m": {{ load_1m }},
+              "load_5m": {{ load_5m }},
+              "load_15m": {{ load_15m }}
             },
             "memory": {
               "total_mb": {{ ansible_memtotal_mb }},
-              "free_mb": {{ ansible_memfree_mb }},
               "used_mb": {{ mem_used_mb }},
+              "free_mb": {{ ansible_memfree_mb }},
               "used_pct": {{ mem_used_pct }}
+            },
+            "disk": {
+              "root_used_pct": {{ root_disk_pct.stdout }}
+            },
+            "alerts": {
+              "disk_warning": {{ is_disk_warning | lower }},
+              "disk_critical": {{ is_disk_critical | lower }},
+              "memory_warning": {{ is_memory_warning | lower }},
+              "load_high": {{ is_load_high | lower }}
             },
             "services": {
               "failed_count": {{ (failed_services.stdout_lines | length) if failed_services.stdout else 0 }}
@@ -131,7 +184,7 @@
         - report
         - json
 
-    - name: Generate human-readable system health audit report
+    - name: Generate Human-Readable System Health Audit Report (Text Format)
       copy:
         dest: "{{ report_dir }}/system_health_report.txt"
         content: |
@@ -146,29 +199,37 @@
           --------------------------------------------------------------------------------
           CPU & WORKLOAD TELEMETRY
           --------------------------------------------------------------------------------
-          Logical Cores      : {{ ansible_processor_vcpus | default(ansible_processor_cores) }}
+          Logical Cores      : {{ cpu_cores }}
           Load Averages      : 1m: {{ load_1m }} | 5m: {{ load_5m }} | 15m: {{ load_15m }}
+          Load State         : {{ 'HIGH LOAD WARNING' if is_load_high else 'NORMAL' }}
+
+          Top CPU Processes:
+          {{ top_cpu_processes.stdout }}
           --------------------------------------------------------------------------------
           MEMORY TELEMETRY
           --------------------------------------------------------------------------------
           Total Memory       : {{ ansible_memtotal_mb }} MB
           Used Memory        : {{ mem_used_mb }} MB ({{ mem_used_pct }}%)
           Free Memory        : {{ ansible_memfree_mb }} MB
-          Swap Total         : {{ ansible_swaptotal_mb | default(0) }} MB
-          Swap Free          : {{ ansible_swapfree_mb | default(0) }} MB
+          Swap Total / Free  : {{ ansible_swaptotal_mb | default(0) }} MB / {{ ansible_swapfree_mb | default(0) }} MB
+          Memory Alert State : {{ 'WARNING THRESHOLD EXCEEDED' if is_memory_warning else 'HEALTHY' }}
+
+          Top Memory Processes:
+          {{ top_mem_processes.stdout }}
           --------------------------------------------------------------------------------
           STORAGE UTILIZATION
           --------------------------------------------------------------------------------
+          Root Partition     : {{ root_disk_pct.stdout }}% Used (Warning: {{ disk_warning_threshold }}%, Critical: {{ disk_critical_threshold }}%)
           {% for mount in ansible_mounts %}
-          Mountpoint: {{ mount.mount }} (Device: {{ mount.device }}, FSType: {{ mount.fstype }})
+          Mount: {{ mount.mount }} (Device: {{ mount.device }}, FSType: {{ mount.fstype }})
             Total: {{ (mount.size_total / 1073741824) | round(2) }} GB | Free: {{ (mount.size_available / 1073741824) | round(2) }} GB | Used: {{ (((mount.size_total - mount.size_available) / mount.size_total) * 100) | round(1) }}%
           {% endfor %}
           --------------------------------------------------------------------------------
-          SERVICES & SYSTEM STATUS
+          SERVICES & SYSTEM INTEGRITY
           --------------------------------------------------------------------------------
-          Failed Systemd Units: {{ failed_services.stdout_lines | length if failed_services.stdout else 0 }}
-          Reboot Required     : {{ 'YES' if reboot_flag.stat.exists else 'NO' }}
-          Internet Ping (1.1.1.1): {{ 'HEALTHY' if net_ping.rc == 0 else 'UNREACHABLE' }}
+          Failed Units       : {{ failed_services.stdout_lines | length if failed_services.stdout else 0 }}
+          Reboot Required    : {{ 'YES' if reboot_flag.stat.exists else 'NO' }}
+          Internet Ping      : {{ 'HEALTHY' if net_ping.rc == 0 else 'UNREACHABLE' }}
           ================================================================================
         owner: root
         group: root
@@ -177,22 +238,66 @@
         - report
         - text
 
-    - name: Prune audit reports older than retention limit
+    - name: Deploy Alert Webhook Dispatcher Helper
+      copy:
+        dest: /usr/local/bin/system-alert-notify.sh
+        owner: root
+        group: root
+        mode: "0750"
+        content: |
+          #!/usr/bin/env bash
+          # System Monitoring Alert Dispatcher
+          set -euo pipefail
+          
+          WEBHOOK_URL="{{ alert_webhook_url }}"
+          SUMMARY="${1:-System Alert}"
+          DETAILS="${2:-No details provided}"
+          
+          if [[ -z "${WEBHOOK_URL}" ]]; then
+            exit 0
+          fi
+          
+          PAYLOAD=$(jq -n \
+            --arg host "$(hostname -f)" \
+            --arg sum "$SUMMARY" \
+            --arg det "$DETAILS" \
+            --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{hostname: $host, summary: $sum, details: $det, timestamp: $time}')
+            
+          curl -s -X POST -H "Content-Type: application/json" -d "${PAYLOAD}" "${WEBHOOK_URL}" || true
+      tags:
+        - alerts
+
+    - name: Trigger Webhook Notification If Critical Threshold Exceeded
+      command: >
+        /usr/local/bin/system-alert-notify.sh "CRITICAL RESOURCE ALERT"
+        "Disk Used: {{ root_disk_pct.stdout }}%, Memory Used: {{ mem_used_pct }}%, Load 1m: {{ load_1m }}"
+      when:
+        - enable_alert_notifications | bool
+        - alert_webhook_url != ""
+        - is_disk_critical or is_memory_warning or is_load_high
+      changed_when: true
+      tags:
+        - alerts
+
+    - name: Prune Audit Reports Older than Retention Window
       command: find {{ report_dir }} -type f -mtime +{{ report_retention_days }} -delete
       changed_when: false
       tags:
         - maintenance
 
-    - name: Display System Health Audit Dashboard
+    - name: Display Comprehensive System Health Audit Dashboard
       debug:
         msg:
-          - "================= [ HEALTH AUDIT SUMMARY ] ================="
+          - "================= [ ENTERPRISE HEALTH AUDIT DASHBOARD ] ================="
           - "Host: {{ ansible_hostname }} | Kernel: {{ ansible_kernel }}"
-          - "Load (1m/5m/15m): {{ load_1m }} / {{ load_5m }} / {{ load_15m }}"
-          - "Memory Used: {{ mem_used_pct }}% ({{ mem_used_mb }} MB / {{ ansible_memtotal_mb }} MB)"
+          - "Load (1m/5m/15m): {{ load_1m }} / {{ load_5m }} / {{ load_15m }} ({{ 'ALERT: High Load' if is_load_high else 'Optimal' }})"
+          - "Memory: {{ mem_used_pct }}% used ({{ mem_used_mb }} MB / {{ ansible_memtotal_mb }} MB) ({{ 'WARNING: High Memory' if is_memory_warning else 'Healthy' }})"
+          - "Root Disk: {{ root_disk_pct.stdout }}% used ({{ 'CRITICAL: High Disk' if is_disk_critical else ('WARNING: Elevated Disk' if is_disk_warning else 'Normal') }})"
           - "Failed Services: {{ failed_services.stdout_lines | length if failed_services.stdout else 'None' }}"
-          - "Reboot Required: {{ 'YES (Action Recommended)' if reboot_flag.stat.exists else 'NO' }}"
-          - "Audit Logs written to: {{ report_dir }}/"
-          - "==========================================================="
+          - "Reboot Required: {{ 'YES (Kernel/Library update pending)' if reboot_flag.stat.exists else 'NO' }}"
+          - "Internet Reachability: {{ 'Connected' if net_ping.rc == 0 else 'UNREACHABLE' }}"
+          - "Telemetry Artifacts: {{ report_dir }}/"
+          - "=========================================================================="
       tags:
-        - verify
+        - summary
