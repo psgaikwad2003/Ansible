@@ -1,26 +1,49 @@
 ---
-- name: Automated Multi-Database Backup Engine
+- name: Enterprise Multi-Database Backup Engine & Cloud Archive
   hosts: db
   become: yes
+  gather_facts: yes
 
   vars:
     backup_base_dir: "/var/backups/databases"
     backup_script_path: "/usr/local/bin/backup-databases.sh"
+    backup_notify_script: "/usr/local/bin/backup-notify.sh"
     backup_log_path: "/var/log/db_backup.log"
     backup_date: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
     backup_retention_days: 14
+    min_disk_free_mb: 5120
+    
+    # Target Databases
+    mysql_backup_enabled: true
     mysql_backup_db: "production_db"
     mysql_backup_user: "root"
-    mysql_backup_password: "RootSecurePassword@2026"
+    mysql_backup_password: "{{ vault_mysql_backup_password | default('RootSecurePassword@2026') }}"
+    
+    postgres_backup_enabled: true
     postgres_backup_db: "production_db"
     postgres_backup_user: "postgres"
+    
+    mongodb_backup_enabled: true
+    mongodb_backup_db: "production_mongo_db"
+    mongodb_backup_uri: "mongodb://127.0.0.1:27017"
+
+    redis_backup_enabled: true
+    redis_dir: "/var/lib/redis"
+    
+    # Cloud Storage & Security
     backup_s3_bucket: "s3://company-cloud-backups-archive/db-snapshots"
     enable_s3_upload: true
     aws_default_region: "us-east-1"
+    s3_storage_class: "STANDARD_IA"
+    s3_sse_algorithm: "AES256"
+    
+    # Notification Webhook
+    alert_webhook_url: ""
+    cron_hour: "2"
+    cron_minute: "0"
 
   tasks:
-
-    - name: Install Database Client and Compression Utilities
+    - name: Install Database Client Toolchains, Archiving & Cloud Utilities
       apt:
         name:
           - mysql-client
@@ -28,12 +51,21 @@
           - postgresql-client
           - gzip
           - pigz
+          - tar
           - coreutils
           - awscli
+          - curl
+          - jq
+          - logrotate
+          - util-linux
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
 
-    - name: Create Dedicated Backup Directory Hierarchy
+    - name: Create Dedicated Backup Directory Hierarchy with Restricted Access
       file:
         path: "{{ item }}"
         state: directory
@@ -44,60 +76,61 @@
         - "{{ backup_base_dir }}"
         - "{{ backup_base_dir }}/mysql"
         - "{{ backup_base_dir }}/postgresql"
+        - "{{ backup_base_dir }}/mongodb"
+        - "{{ backup_base_dir }}/redis"
         - "{{ backup_base_dir }}/checksums"
+      tags:
+        - directories
 
-    - name: Execute MySQL Database Backup with Gzip Compression
-      shell: >
-        mysqldump -u {{ mysql_backup_user }} -p'{{ mysql_backup_password }}'
-        --single-transaction --quick --routines --triggers {{ mysql_backup_db }}
-        | gzip -9 > {{ backup_base_dir }}/mysql/{{ mysql_backup_db }}_{{ backup_date }}.sql.gz
-      args:
-        executable: /bin/bash
-      no_log: true
-      ignore_errors: yes
+    - name: Pre-Flight Check - Validate Available Disk Space on Backup Mount
+      shell: "df -m '{{ backup_base_dir }}' | tail -n 1 | awk '{print $4}'"
+      register: available_space_mb
+      changed_when: false
+      tags:
+        - preflight
 
-    - name: Execute PostgreSQL Database Backup with Gzip Compression
-      become_user: "{{ postgres_backup_user }}"
-      shell: >
-        pg_dump -Fc {{ postgres_backup_db }} > {{ backup_base_dir }}/postgresql/{{ postgres_backup_db }}_{{ backup_date }}.dump
-      args:
-        executable: /bin/bash
-      ignore_errors: yes
+    - name: Assert Sufficient Storage Capacity for Database Backups
+      assert:
+        that:
+          - available_space_mb.stdout | int >= min_disk_free_mb
+        fail_msg: "Insufficient disk space on backup target: {{ available_space_mb.stdout }}MB available, minimum {{ min_disk_free_mb }}MB required."
+        success_msg: "Disk capacity assertion passed: {{ available_space_mb.stdout }}MB available."
+      tags:
+        - preflight
 
-    - name: Generate SHA256 Integrity Checksums for Backups
-      shell: >
-        sha256sum {{ backup_base_dir }}/*/*{{ backup_date }}* > {{ backup_base_dir }}/checksums/checksums_{{ backup_date }}.sha256
-      args:
-        executable: /bin/bash
-      ignore_errors: yes
+    - name: Deploy Backup Failure / Success Notification Helper Script
+      copy:
+        dest: "{{ backup_notify_script }}"
+        owner: root
+        group: root
+        mode: "0750"
+        content: |
+          #!/usr/bin/env bash
+          # Webhook notification dispatcher for database backup engine
+          set -euo pipefail
+          
+          STATUS="${1:-INFO}"
+          MESSAGE="${2:-No details provided}"
+          WEBHOOK_URL="{{ alert_webhook_url }}"
+          
+          if [[ -z "${WEBHOOK_URL}" ]]; then
+            echo "[$(date)] Webhook URL not set. Notification skipped: [${STATUS}] ${MESSAGE}" >> {{ backup_log_path }}
+            exit 0
+          fi
+          
+          PAYLOAD=$(jq -n \
+            --arg status "$STATUS" \
+            --arg msg "$MESSAGE" \
+            --arg host "$(hostname -f)" \
+            --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{status: $status, hostname: $host, timestamp: $time, message: $msg}')
+          
+          curl -s -X POST -H "Content-Type: application/json" -d "${PAYLOAD}" "${WEBHOOK_URL}" || true
+      tags:
+        - notification
+        - scripts
 
-    - name: Sync Compressed Backups to Remote Cloud Storage (S3)
-      shell: >
-        aws s3 sync {{ backup_base_dir }} {{ backup_s3_bucket }}
-        --exclude "*"
-        --include "*{{ backup_date }}*"
-        --region {{ aws_default_region }}
-        --storage-class STANDARD_IA
-      when: enable_s3_upload | bool
-      ignore_errors: yes
-
-    - name: Purge Local Backups Older than Retention Period
-      find:
-        paths:
-          - "{{ backup_base_dir }}/mysql"
-          - "{{ backup_base_dir }}/postgresql"
-          - "{{ backup_base_dir }}/checksums"
-        age: "{{ backup_retention_days }}d"
-        recurse: yes
-      register: expired_backups
-
-    - name: Remove Expired Backup Archives
-      file:
-        path: "{{ item.path }}"
-        state: absent
-      loop: "{{ expired_backups.files }}"
-
-    - name: Deploy Standalone Automated Backup Shell Script
+    - name: Deploy Standalone Automated Multi-Database Backup Shell Script
       copy:
         dest: "{{ backup_script_path }}"
         owner: root
@@ -105,29 +138,156 @@
         mode: "0750"
         content: |
           #!/usr/bin/env bash
+          # Production Multi-Database Backup Engine with Flock Concurrency Lock
           set -euo pipefail
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          echo "[$(date)] Starting scheduled database backup routine..." >> {{ backup_log_path }}
-          
-          # MySQL Dump
-          if command -v mysqldump &> /dev/null; then
-            mysqldump -u {{ mysql_backup_user }} -p'{{ mysql_backup_password }}' --single-transaction {{ mysql_backup_db }} | gzip -9 > {{ backup_base_dir }}/mysql/{{ mysql_backup_db }}_${TIMESTAMP}.sql.gz || true
-          fi
-          
-          # PostgreSQL Dump
-          if command -v pg_dump &> /dev/null; then
-            su - {{ postgres_backup_user }} -c "pg_dump -Fc {{ postgres_backup_db }} > {{ backup_base_dir }}/postgresql/{{ postgres_backup_db }}_${TIMESTAMP}.dump" || true
-          fi
-          
-          # Prune expired
-          find {{ backup_base_dir }} -type f -mtime +{{ backup_retention_days }} -delete
-          echo "[$(date)] Scheduled backup completed successfully." >> {{ backup_log_path }}
 
-    - name: Schedule Daily Cron Job for Database Backups at 02:00 UTC
+          LOCK_FILE="/var/run/db_backup.lock"
+          exec 200>"${LOCK_FILE}"
+          flock -n 200 || {
+            echo "[$(date)] Backup process already running. Exiting." >> {{ backup_log_path }}
+            exit 1
+          }
+
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          echo "==========================================================" >> {{ backup_log_path }}
+          echo "[$(date)] Starting automated enterprise database backup routine..." >> {{ backup_log_path }}
+
+          # 1. MySQL Backup
+          if [[ "{{ mysql_backup_enabled | bool }}" == "True" ]] && command -v mysqldump &> /dev/null; then
+            echo "[$(date)] Starting MySQL backup for: {{ mysql_backup_db }}" >> {{ backup_log_path }}
+            if mysqldump -u {{ mysql_backup_user }} -p'{{ mysql_backup_password }}' \
+              --single-transaction --quick --routines --triggers --events \
+              {{ mysql_backup_db }} | pigz -p 2 > {{ backup_base_dir }}/mysql/{{ mysql_backup_db }}_${TIMESTAMP}.sql.gz; then
+              echo "[$(date)] MySQL dump completed successfully." >> {{ backup_log_path }}
+            else
+              echo "[$(date)] ERROR: MySQL dump failed!" >> {{ backup_log_path }}
+              {{ backup_notify_script }} "ERROR" "MySQL dump failed on $(hostname) for database {{ mysql_backup_db }}"
+            fi
+          fi
+
+          # 2. PostgreSQL Backup
+          if [[ "{{ postgres_backup_enabled | bool }}" == "True" ]] && command -v pg_dump &> /dev/null; then
+            echo "[$(date)] Starting PostgreSQL backup for: {{ postgres_backup_db }}" >> {{ backup_log_path }}
+            if su - {{ postgres_backup_user }} -c "pg_dump -Fc {{ postgres_backup_db }} > {{ backup_base_dir }}/postgresql/{{ postgres_backup_db }}_${TIMESTAMP}.dump"; then
+              echo "[$(date)] PostgreSQL dump completed successfully." >> {{ backup_log_path }}
+            else
+              echo "[$(date)] ERROR: PostgreSQL dump failed!" >> {{ backup_log_path }}
+              {{ backup_notify_script }} "ERROR" "PostgreSQL dump failed on $(hostname) for database {{ postgres_backup_db }}"
+            fi
+          fi
+
+          # 3. MongoDB Backup
+          if [[ "{{ mongodb_backup_enabled | bool }}" == "True" ]] && command -v mongodump &> /dev/null; then
+            echo "[$(date)] Starting MongoDB backup for: {{ mongodb_backup_db }}" >> {{ backup_log_path }}
+            if mongodump --uri="{{ mongodb_backup_uri }}" --db="{{ mongodb_backup_db }}" \
+              --gzip --archive="{{ backup_base_dir }}/mongodb/{{ mongodb_backup_db }}_${TIMESTAMP}.archive.gz"; then
+              echo "[$(date)] MongoDB dump completed successfully." >> {{ backup_log_path }}
+            else
+              echo "[$(date)] ERROR: MongoDB dump failed!" >> {{ backup_log_path }}
+              {{ backup_notify_script }} "ERROR" "MongoDB dump failed on $(hostname) for database {{ mongodb_backup_db }}"
+            fi
+          fi
+
+          # 4. Redis Backup
+          if [[ "{{ redis_backup_enabled | bool }}" == "True" ]] && command -v redis-cli &> /dev/null; then
+            echo "[$(date)] Triggering Redis BGSAVE..." >> {{ backup_log_path }}
+            redis-cli bgsave || true
+            sleep 3
+            if [[ -f "{{ redis_dir }}/dump.rdb" ]]; then
+              cp "{{ redis_dir }}/dump.rdb" "{{ backup_base_dir }}/redis/redis_dump_${TIMESTAMP}.rdb"
+              echo "[$(date)] Redis snapshot preserved successfully." >> {{ backup_log_path }}
+            fi
+          fi
+
+          # 5. SHA256 Integrity Verification Checksums
+          echo "[$(date)] Generating SHA256 checksums..." >> {{ backup_log_path }}
+          find {{ backup_base_dir }} -type f -name "*${TIMESTAMP}*" ! -path "*/checksums/*" -exec sha256sum {} + > {{ backup_base_dir }}/checksums/checksums_${TIMESTAMP}.sha256 || true
+
+          # 6. Cloud S3 Sync
+          if [[ "{{ enable_s3_upload | bool }}" == "True" ]] && command -v aws &> /dev/null; then
+            echo "[$(date)] Syncing backups to Cloud Storage: {{ backup_s3_bucket }}" >> {{ backup_log_path }}
+            if aws s3 sync {{ backup_base_dir }} {{ backup_s3_bucket }} \
+              --exclude "*" \
+              --include "*${TIMESTAMP}*" \
+              --region {{ aws_default_region }} \
+              --storage-class {{ s3_storage_class }} \
+              --sse {{ s3_sse_algorithm }}; then
+              echo "[$(date)] Cloud S3 archive sync completed successfully." >> {{ backup_log_path }}
+            else
+              echo "[$(date)] WARNING: Cloud S3 sync failed!" >> {{ backup_log_path }}
+              {{ backup_notify_script }} "WARNING" "S3 backup upload failed on $(hostname)"
+            fi
+          fi
+
+          # 7. Local Retention Pruning
+          echo "[$(date)] Purging local backups older than {{ backup_retention_days }} days..." >> {{ backup_log_path }}
+          find {{ backup_base_dir }} -type f -mtime +{{ backup_retention_days }} -delete
+          echo "[$(date)] Backup routine finished successfully." >> {{ backup_log_path }}
+          {{ backup_notify_script }} "SUCCESS" "Scheduled database backup routine completed successfully on $(hostname)"
+      tags:
+        - scripts
+
+    - name: Configure Dedicated Logrotate Policy for Backup Logs
+      copy:
+        dest: /etc/logrotate.d/db-backup
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ backup_log_path }} {
+              weekly
+              missingok
+              rotate 12
+              compress
+              delaycompress
+              notifempty
+              create 0640 root root
+          }
+      tags:
+        - logrotate
+
+    - name: Trigger Ad-Hoc Execution of Backup Script to Validate Operation
+      command: "{{ backup_script_path }}"
+      register: initial_backup_run
+      changed_when: true
+      ignore_errors: yes
+      tags:
+        - execution
+
+    - name: Schedule Automated Cron Routine for Database Backups
       cron:
-        name: "Enterprise Multi-Database Automated Backup"
-        minute: "0"
-        hour: "2"
+        name: "Enterprise Multi-Database Automated Cloud Backup Engine"
+        minute: "{{ cron_minute }}"
+        hour: "{{ cron_hour }}"
         job: "{{ backup_script_path }} >> {{ backup_log_path }} 2>&1"
         user: root
         state: present
+      tags:
+        - cron
+
+    - name: Inspect Generated Backup Archives in Base Directory
+      find:
+        paths: "{{ backup_base_dir }}"
+        recurse: yes
+        file_type: file
+      register: existing_backups
+      tags:
+        - audit
+
+    - name: Output Enterprise Backup Engine Summary
+      debug:
+        msg:
+          - "=========================================================="
+          - "  DATABASE BACKUP ENGINE DEPLOYMENT SUMMARY               "
+          - "=========================================================="
+          - "Backup Target Base Dir  : {{ backup_base_dir }}"
+          - "Retention Policy        : {{ backup_retention_days }} Days"
+          - "S3 Destination Bucket   : {{ backup_s3_bucket }}"
+          - "S3 Encryption Algorithm : {{ s3_sse_algorithm }}"
+          - "Cron Schedule           : Daily at {{ cron_hour }}:{{ cron_minute }} UTC"
+          - "Log File Location       : {{ backup_log_path }}"
+          - "Concurrency Protection  : flock -n /var/run/db_backup.lock"
+          - "Found Backup Files      : {{ existing_backups.matched }} file(s) currently stored"
+          - "=========================================================="
+      tags:
+        - summary
