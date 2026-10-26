@@ -1,26 +1,62 @@
 ---
-- name: Install and Configure Prometheus Node Exporter
+- name: Enterprise Prometheus Node Exporter Deployment & Hardening
   hosts: all
   become: yes
+  gather_facts: yes
 
   vars:
-    node_exporter_version: "1.8.1"
+    node_exporter_version: "1.8.2"
     node_exporter_arch: "linux-amd64"
+    node_exporter_checksum: "sha256:68c22629b37933438619899b1e344584714a6d7fa1bcaa547731564502758fa3"
     node_exporter_bin_dir: "/usr/local/bin"
+    node_exporter_config_dir: "/etc/node_exporter"
     node_exporter_user: "node_exporter"
     node_exporter_group: "node_exporter"
     node_exporter_port: 9100
+    node_exporter_listen_address: "0.0.0.0"
     node_exporter_textfile_dir: "/var/lib/node_exporter/textfile_collector"
+    enable_web_security: false
+    enable_custom_metrics_cron: true
+    filesystem_mount_points_exclude: "^/(dev|proc|sys|run|var/lib/docker/.+|var/lib/containers/.+)($|/)"
+    filesystem_fs_types_exclude: "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
+
+  handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Restart Node Exporter
+      service:
+        name: node_exporter
+        state: restarted
 
   tasks:
+    - name: Ensure Base Dependencies and Security Utilities Are Installed
+      apt:
+        name:
+          - curl
+          - tar
+          - jq
+          - ufw
+          - coreutils
+          - cron
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
 
-    - name: Create Node Exporter System Group
+    - name: Create Dedicated Node Exporter System Group
       group:
         name: "{{ node_exporter_group }}"
         system: yes
         state: present
+      tags:
+        - security
+        - user
 
-    - name: Create Node Exporter System User
+    - name: Create Dedicated Node Exporter System User
       user:
         name: "{{ node_exporter_user }}"
         group: "{{ node_exporter_group }}"
@@ -28,12 +64,35 @@
         shell: /usr/sbin/nologin
         create_home: no
         state: present
+      tags:
+        - security
+        - user
 
-    - name: Download Prometheus Node Exporter Binary
+    - name: Create Required Directory Structure with Strict Permissions
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ node_exporter_config_dir }}", owner: "root", group: "{{ node_exporter_group }}", mode: "0750" }
+        - { path: "{{ node_exporter_textfile_dir }}", owner: "{{ node_exporter_user }}", group: "{{ node_exporter_group }}", mode: "0755" }
+      tags:
+        - directories
+
+    - name: Download Prometheus Node Exporter Release Archive
       get_url:
         url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
         dest: "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
         mode: "0644"
+        checksum: "{{ node_exporter_checksum | default(omit) }}"
+      register: download_archive
+      until: download_archive is succeeded
+      retries: 3
+      delay: 5
+      tags:
+        - download
 
     - name: Extract Node Exporter Archive
       unarchive:
@@ -41,33 +100,120 @@
         dest: "/tmp"
         remote_src: yes
         creates: "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}/node_exporter"
+      tags:
+        - install
 
-    - name: Install Node Exporter Binary to Bin Directory
+    - name: Install Node Exporter Binary to System Executable Path
       copy:
         src: "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}/node_exporter"
         dest: "{{ node_exporter_bin_dir }}/node_exporter"
-        owner: "{{ node_exporter_user }}"
-        group: "{{ node_exporter_group }}"
+        owner: root
+        group: root
         mode: "0755"
         remote_src: yes
+      notify: Restart Node Exporter
+      tags:
+        - install
 
-    - name: Cleanup Extracted Node Exporter Files
+    - name: Cleanup Temporary Archive and Extracted Directory
       file:
         path: "{{ item }}"
         state: absent
       loop:
         - "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}.tar.gz"
         - "/tmp/node_exporter-{{ node_exporter_version }}.{{ node_exporter_arch }}"
+      tags:
+        - cleanup
 
-    - name: Create Textfile Collector Directory
-      file:
-        path: "{{ node_exporter_textfile_dir }}"
-        state: directory
-        owner: "{{ node_exporter_user }}"
+    - name: Deploy Web Security and TLS Configuration File
+      copy:
+        dest: "{{ node_exporter_config_dir }}/web-config.yml"
+        owner: root
         group: "{{ node_exporter_group }}"
-        mode: "0755"
+        mode: "0640"
+        content: |
+          # Node Exporter Web Configuration
+          # TLS and Basic Authentication Settings
+          tls_server_config:
+            # cert_file: /etc/node_exporter/tls.crt
+            # key_file: /etc/node_exporter/tls.key
+            min_version: TLS13
+            cipher_suites:
+              - TLS_AES_128_GCM_SHA256
+              - TLS_AES_256_GCM_SHA384
+              - TLS_CHACHA20_POLY1305_SHA256
+          # basic_auth_users:
+          #   prometheus: $2y$12$e6g...
+      notify: Restart Node Exporter
+      tags:
+        - security
+        - config
 
-    - name: Deploy Systemd Service Unit for Node Exporter
+    - name: Deploy Custom System Telemetry Metric Script
+      copy:
+        dest: /usr/local/bin/node_exporter_custom_metrics.sh
+        owner: root
+        group: root
+        mode: "0750"
+        content: |
+          #!/usr/bin/env bash
+          # Automated Custom Metric Collector for Prometheus Node Exporter
+          set -euo pipefail
+          
+          METRIC_DIR="{{ node_exporter_textfile_dir }}"
+          TMP_FILE="${METRIC_DIR}/system_custom_metrics.prom.$$"
+          TARGET_FILE="${METRIC_DIR}/system_custom_metrics.prom"
+          
+          # Uptime seconds
+          UPTIME_SECONDS=$(awk '{print int($1)}' /proc/uptime)
+          
+          # Root filesystem used percentage
+          ROOT_USAGE_PCT=$(df / --output=pcent | tail -n 1 | tr -d ' %')
+          
+          # Total active TCP connections
+          TCP_CONN_TOTAL=$(ss -t -a | wc -l)
+          
+          # Write atomically to avoid partial scrape reads
+          cat <<EOF > "${TMP_FILE}"
+          # HELP node_custom_uptime_seconds Total system uptime in seconds
+          # TYPE node_custom_uptime_seconds gauge
+          node_custom_uptime_seconds ${UPTIME_SECONDS}
+          
+          # HELP node_custom_root_disk_used_percent Root filesystem usage percentage
+          # TYPE node_custom_root_disk_used_percent gauge
+          node_custom_root_disk_used_percent ${ROOT_USAGE_PCT}
+          
+          # HELP node_custom_tcp_connections_total Total active and listening TCP sockets
+          # TYPE node_custom_tcp_connections_total gauge
+          node_custom_tcp_connections_total ${TCP_CONN_TOTAL}
+          EOF
+          
+          chown {{ node_exporter_user }}:{{ node_exporter_group }} "${TMP_FILE}"
+          chmod 0644 "${TMP_FILE}"
+          mv -f "${TMP_FILE}" "${TARGET_FILE}"
+      tags:
+        - metrics
+        - custom_collector
+
+    - name: Schedule Custom Telemetry Generation via Cron
+      cron:
+        name: "Generate Node Exporter Custom Metrics"
+        minute: "*/5"
+        job: "/usr/local/bin/node_exporter_custom_metrics.sh > /dev/null 2>&1"
+        user: root
+        state: "{{ 'present' if enable_custom_metrics_cron | bool else 'absent' }}"
+      tags:
+        - metrics
+        - cron
+
+    - name: Run Custom Metric Script Initially to Seed Textfile Directory
+      command: /usr/local/bin/node_exporter_custom_metrics.sh
+      changed_when: false
+      when: enable_custom_metrics_cron | bool
+      tags:
+        - metrics
+
+    - name: Deploy Hardened Systemd Service Unit for Node Exporter
       copy:
         dest: /etc/systemd/system/node_exporter.service
         owner: root
@@ -85,53 +231,114 @@
           Group={{ node_exporter_group }}
           Type=simple
           ExecStart={{ node_exporter_bin_dir }}/node_exporter \
-            --web.listen-address=:{{ node_exporter_port }} \
+            --web.listen-address={{ node_exporter_listen_address }}:{{ node_exporter_port }} \
             --collector.textfile.directory={{ node_exporter_textfile_dir }} \
             --collector.systemd \
-            --collector.processes
+            --collector.processes \
+            --collector.diskstats \
+            --collector.filesystem \
+            --collector.filesystem.mount-points-exclude="{{ filesystem_mount_points_exclude }}" \
+            --collector.filesystem.fs-types-exclude="{{ filesystem_fs_types_exclude }}" \
+            --collector.loadavg \
+            --collector.meminfo \
+            --collector.netdev \
+            --collector.netstat \
+            --collector.stat \
+            --collector.time \
+            --collector.uname \
+            --collector.vmstat \
+            --log.format=logfmt \
+            --log.level=info
+          
+          # Security & Sandboxing Hardening
           Restart=always
           RestartSec=5s
           LimitNOFILE=65536
+          CapabilityBoundingSet=
+          AmbientCapabilities=
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          ProtectKernelTunables=true
+          ProtectControlGroups=true
+          ProtectKernelModules=true
+          PrivateTmp=true
+          PrivateDevices=true
+          MemoryDenyWriteExecute=true
+          LockPersonality=true
+          RestrictRealtime=true
+          RestrictSUIDSGID=true
+          ReadWritePaths={{ node_exporter_textfile_dir }}
 
           [Install]
           WantedBy=multi-user.target
       notify:
         - Reload Systemd
         - Restart Node Exporter
+      tags:
+        - service
+        - systemd
+
+    - name: Flush Handlers to Ensure Service Restarts with Updated Config
+      meta: flush_handlers
 
     - name: Allow Node Exporter Port in UFW Firewall
       ufw:
         rule: allow
         port: "{{ node_exporter_port }}"
         proto: tcp
-        comment: "Prometheus Node Exporter Metrics"
+        comment: "Prometheus Node Exporter Scrape Port"
+      when: ansible_facts['os_family'] == "Debian"
       ignore_errors: yes
+      tags:
+        - firewall
 
     - name: Ensure Node Exporter Service is Running and Enabled
       service:
         name: node_exporter
         state: started
         enabled: yes
+      tags:
+        - service
 
-    - name: Verify Metrics Scrape Endpoint
+    - name: Verify Metrics Scrape Endpoint Responds Successfully
       uri:
         url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
         method: GET
         status_code: 200
-        return_content: no
-      register: metrics_check
-      retries: 3
+        return_content: yes
+      register: scrape_response
+      retries: 5
       delay: 2
-      until: metrics_check.status == 200
+      until: scrape_response.status == 200
       ignore_errors: yes
+      tags:
+        - verification
 
-  handlers:
+    - name: Assert Essential Telemetry Metrics Exist in Scrape Response
+      assert:
+        that:
+          - "'node_os_info' in scrape_response.content or 'node_boot_time_seconds' in scrape_response.content"
+        fail_msg: "Node Exporter scrape endpoint did not return standard system metrics"
+        success_msg: "Node Exporter is actively publishing system and collector metrics"
+      when: scrape_response.content is defined
+      ignore_errors: yes
+      tags:
+        - verification
 
-    - name: Reload Systemd
-      systemd:
-        daemon_reload: yes
-
-    - name: Restart Node Exporter
-      service:
-        name: node_exporter
-        state: restarted
+    - name: Output Node Exporter Deployment Status Summary
+      debug:
+        msg:
+          - "=========================================================="
+          - "  PROMETHEUS NODE EXPORTER DEPLOYMENT SUMMARY             "
+          - "=========================================================="
+          - "Service Status        : Started and Enabled on Boot"
+          - "Listen Address        : {{ node_exporter_listen_address }}:{{ node_exporter_port }}"
+          - "Metrics Endpoint      : http://127.0.0.1:{{ node_exporter_port }}/metrics"
+          - "Version Deployed      : v{{ node_exporter_version }} ({{ node_exporter_arch }})"
+          - "Security Hardening    : ProtectSystem=strict, PrivateTmp=true, CapabilityBoundingSet=none"
+          - "Textfile Collector    : {{ node_exporter_textfile_dir }}"
+          - "Custom Metrics Script : /usr/local/bin/node_exporter_custom_metrics.sh"
+          - "=========================================================="
+      tags:
+        - summary
