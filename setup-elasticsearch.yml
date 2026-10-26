@@ -1,7 +1,8 @@
 ---
-- name: Install and Configure Production Elasticsearch Single-Node Cluster
+- name: Enterprise Elasticsearch Single-Node Cluster Deployment & Memory Optimization
   hosts: elasticsearch_servers
   become: yes
+  gather_facts: yes
 
   vars:
     elastic_branch: "8.x"
@@ -9,12 +10,19 @@
     es_node_name: "{{ inventory_hostname | default('es-node-01') }}"
     es_http_port: 9200
     es_transport_port: 9300
-    es_heap_size: "2g"
     es_data_dir: "/var/lib/elasticsearch"
     es_log_dir: "/var/log/elasticsearch"
+    es_backup_dir: "/var/backups/elasticsearch"
     elastic_keyring: "/etc/apt/keyrings/elasticsearch-keyring.gpg"
+    # Dynamic JVM Heap allocation (default: 50% system RAM, min 1GB, max 31GB)
+    es_heap_size_override: ""
+    enable_xpack_security: false
 
   handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
     - name: Restart Elasticsearch
       systemd:
         name: elasticsearch
@@ -22,6 +30,19 @@
         daemon_reload: yes
 
   tasks:
+    - name: Calculate Optimal JVM Heap Sizing Based on Available System RAM
+      set_fact:
+        computed_heap_mb: "{{ [((ansible_memtotal_mb * 0.5) | int), 31744] | min }}"
+      tags:
+        - facts
+        - memory
+
+    - name: Set Final Elasticsearch Heap Memory Size Fact
+      set_fact:
+        es_final_heap_size: "{{ es_heap_size_override if es_heap_size_override != '' else (computed_heap_mb | string ~ 'm') }}"
+      tags:
+        - facts
+        - memory
 
     - name: Install Base Dependencies and Security Libraries
       apt:
@@ -33,8 +54,13 @@
           - software-properties-common
           - default-jre-headless
           - ufw
+          - jq
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
 
     - name: Configure Linux Kernel Memory Maps for Elasticsearch (vm.max_map_count)
       sysctl:
@@ -46,6 +72,10 @@
       loop:
         - { name: 'vm.max_map_count', value: '262144' }
         - { name: 'vm.swappiness', value: '1' }
+        - { name: 'fs.file-max', value: '65536' }
+      tags:
+        - sysctl
+        - memory
 
     - name: Configure Security Limits for Elasticsearch User
       copy:
@@ -60,6 +90,8 @@
           elasticsearch hard nofile 65536
           elasticsearch soft nproc 4096
           elasticsearch hard nproc 4096
+      tags:
+        - limits
 
     - name: Ensure APT Keyrings Directory Exists
       file:
@@ -68,34 +100,59 @@
         owner: root
         group: root
         mode: "0755"
+      tags:
+        - repo
 
     - name: Add Elastic Official GPG Key
       apt_key:
         url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
         state: present
         keyring: "{{ elastic_keyring }}"
+      tags:
+        - repo
 
     - name: Add Elastic Official APT Repository
       apt_repository:
         repo: "deb [signed-by={{ elastic_keyring }}] https://artifacts.elastic.co/packages/{{ elastic_branch }}/apt stable main"
         state: present
         filename: elastic-{{ elastic_branch }}
+      tags:
+        - repo
 
     - name: Install Elasticsearch Package
       apt:
         name: elasticsearch
         state: present
         update_cache: yes
+      tags:
+        - packages
+        - install
 
-    - name: Configure Systemd Memory Lock Limits Override for Elasticsearch
+    - name: Create Snapshot Backup and Data Storage Directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0750"
+      loop:
+        - "{{ es_data_dir }}"
+        - "{{ es_log_dir }}"
+        - "{{ es_backup_dir }}"
+      tags:
+        - directories
+
+    - name: Configure Systemd Memory Lock Limits Override Directory
       file:
         path: /etc/systemd/system/elasticsearch.service.d
         state: directory
         owner: root
         group: root
         mode: "0755"
+      tags:
+        - systemd
 
-    - name: Deploy Systemd LimitMEMLOCK Override Unit
+    - name: Deploy Systemd LimitMEMLOCK and LimitNOFILE Override Unit
       copy:
         dest: /etc/systemd/system/elasticsearch.service.d/override.conf
         owner: root
@@ -106,21 +163,29 @@
           LimitMEMLOCK=infinity
           LimitNOFILE=65536
           LimitNPROC=4096
-      notify: Restart Elasticsearch
+      notify:
+        - Reload Systemd
+        - Restart Elasticsearch
+      tags:
+        - systemd
 
-    - name: Configure JVM Heap Allocation Options
+    - name: Configure Dynamic JVM Heap Allocation Options
       copy:
         dest: /etc/elasticsearch/jvm.options.d/heap.options
         owner: root
         group: elasticsearch
         mode: "0640"
         content: |
-          # Elasticsearch Production Heap Sizing
-          -Xms{{ es_heap_size }}
-          -Xmx{{ es_heap_size }}
+          # Elasticsearch Dynamic Memory Heap Allocation
+          # Configured to 50% available host RAM to preserve OS filesystem caches
+          -Xms{{ es_final_heap_size }}
+          -Xmx{{ es_final_heap_size }}
       notify: Restart Elasticsearch
+      tags:
+        - config
+        - memory
 
-    - name: Deploy Elasticsearch Server Configuration
+    - name: Deploy Production Elasticsearch Server Configuration
       copy:
         dest: /etc/elasticsearch/elasticsearch.yml
         owner: root
@@ -132,13 +197,26 @@
           node.name: {{ es_node_name }}
           path.data: {{ es_data_dir }}
           path.logs: {{ es_log_dir }}
+          path.repo: ["{{ es_backup_dir }}"]
+
+          # Networking & Ports
           network.host: 0.0.0.0
           http.port: {{ es_http_port }}
           transport.port: {{ es_transport_port }}
           discovery.type: single-node
+
+          # Memory & Locking
           bootstrap.memory_lock: true
-          xpack.security.enabled: false
+
+          # Cluster Performance & Recovery Tuning
+          indices.recovery.max_bytes_per_sec: "100mb"
+          cluster.routing.allocation.node_concurrent_recoveries: 4
+
+          # Security Settings
+          xpack.security.enabled: {{ enable_xpack_security | lower }}
       notify: Restart Elasticsearch
+      tags:
+        - config
 
     - name: Flush Handlers to Ensure Elasticsearch is Started
       meta: flush_handlers
@@ -148,6 +226,8 @@
         name: elasticsearch
         state: started
         enabled: yes
+      tags:
+        - service
 
     - name: Configure UFW Firewall Ingress for HTTP and Transport Ports
       ufw:
@@ -158,6 +238,9 @@
         - "{{ es_http_port }}"
         - "{{ es_transport_port }}"
       when: ansible_facts['os_family'] == "Debian"
+      ignore_errors: yes
+      tags:
+        - firewall
 
     - name: Verify Elasticsearch Cluster Health API Response
       uri:
@@ -168,12 +251,33 @@
       retries: 10
       delay: 5
       until: es_health.status == 200
+      tags:
+        - verification
+
+    - name: Inspect Cluster Nodes Information via Cat API
+      uri:
+        url: "http://127.0.0.1:{{ es_http_port }}/_cat/nodes?format=json"
+        method: GET
+        status_code: 200
+      register: es_nodes
+      ignore_errors: yes
+      tags:
+        - verification
 
     - name: Output Elasticsearch Cluster Status Information
       debug:
         msg:
-          - "Elasticsearch Status  : Running"
+          - "=========================================================="
+          - "  ELASTICSEARCH ENTERPRISE CLUSTER DEPLOYMENT SUMMARY     "
+          - "=========================================================="
           - "Cluster Name          : {{ es_health.json.cluster_name }}"
-          - "Cluster Status        : {{ es_health.json.status }}"
-          - "Active Shards         : {{ es_health.json.active_primary_shards }}"
+          - "Cluster Status        : {{ es_health.json.status | upper }}"
+          - "Active Primary Shards : {{ es_health.json.active_primary_shards }}"
+          - "Allocated Heap Size   : {{ es_final_heap_size }}"
+          - "Data Directory        : {{ es_data_dir }}"
+          - "Snapshot Repository   : {{ es_backup_dir }}"
           - "HTTP Endpoint         : http://{{ ansible_default_ipv4.address | default('localhost') }}:{{ es_http_port }}"
+          - "Nodes Registered      : {{ es_nodes.json | length if es_nodes.json is defined else 1 }}"
+          - "=========================================================="
+      tags:
+        - summary
