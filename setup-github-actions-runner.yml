@@ -1,41 +1,110 @@
 ---
-- name: Deploy Self-Hosted GitHub Actions CI/CD Runner
+- name: Enterprise Self-Hosted GitHub Actions CI/CD Runner Deployment
   hosts: ci_runners
   become: yes
+  gather_facts: yes
 
   vars:
     runner_version: "2.317.0"
     runner_arch: "linux-x64"
+    runner_checksum: "sha256:9e883d3f089961aab2a1b913ff7181dcd4162ecf750b691ee762db666a018f97"
     runner_user: "actions-runner"
     runner_group: "actions-runner"
     runner_dir: "/opt/actions-runner"
+    runner_work_dir: "/opt/actions-runner/_work"
     github_repo_url: "https://github.com/organization/production-app"
-    runner_name: "prod-runner-01"
-    runner_labels: "self-hosted,linux,x64,production"
-    runner_token: "YOUR_RUNNER_REGISTRATION_TOKEN"
+    runner_name: "{{ inventory_hostname | default('prod-runner-01') }}"
+    runner_labels: "self-hosted,linux,x64,production,docker"
+    runner_token: "{{ vault_runner_registration_token | default('YOUR_RUNNER_REGISTRATION_TOKEN') }}"
+    enable_docker_integration: true
+    enable_nodejs_toolchain: true
+    enable_workspace_cleanup_cron: true
+    workspace_cleanup_retention_days: 7
+
+  handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Restart Runner Service
+      service:
+        name: github-actions-runner
+        state: restarted
 
   tasks:
-
-    - name: Install Runner System Prerequisites and Toolchain
+    - name: Install Base System Dependencies and Build Essentials
       apt:
         name:
           - curl
           - tar
           - jq
           - git
+          - git-lfs
+          - rsync
+          - zip
+          - unzip
           - build-essential
           - libssl-dev
           - libffi-dev
           - python3-pip
+          - python3-venv
           - libicu-dev
           - ca-certificates
+          - ufw
         state: present
         update_cache: yes
+        cache_valid_time: 3600
+      tags:
+        - prerequisites
+        - packages
+
+    - name: Configure Git LFS Globally for CI/CD Builds
+      command: git lfs install --system
+      changed_when: false
+      tags:
+        - toolchain
+
+    - name: Install Node.js LTS Toolchain for Actions Runner Compatibility
+      block:
+        - name: Ensure APT Keyrings Directory Exists
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Add NodeSource Official GPG Key
+          apt_key:
+            url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+            state: present
+            keyring: /etc/apt/keyrings/nodesource.gpg
+
+        - name: Add NodeSource Node.js 20.x APT Repository
+          apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main"
+            state: present
+            filename: nodesource
+
+        - name: Install Node.js and Yarn
+          apt:
+            name:
+              - nodejs
+            state: present
+            update_cache: yes
+      when: enable_nodejs_toolchain | bool
+      tags:
+        - toolchain
+        - nodejs
 
     - name: Create Dedicated Actions Runner System Group
       group:
         name: "{{ runner_group }}"
+        system: yes
         state: present
+      tags:
+        - security
+        - user
 
     - name: Create Dedicated Actions Runner System User
       user:
@@ -44,30 +113,50 @@
         shell: /bin/bash
         home: "/home/{{ runner_user }}"
         create_home: yes
+        system: yes
         state: present
+      tags:
+        - security
+        - user
 
-    - name: Add Runner User to Docker Group if Docker Exists
+    - name: Add Runner User to Docker Group for Container Workflows
       user:
         name: "{{ runner_user }}"
         groups: docker
         append: yes
+      when: enable_docker_integration | bool
       ignore_errors: yes
+      tags:
+        - security
+        - docker
 
-    - name: Create Runner Working Directory
+    - name: Create Runner Root and Workspace Working Directories
       file:
-        path: "{{ runner_dir }}"
+        path: "{{ item.path }}"
         state: directory
         owner: "{{ runner_user }}"
         group: "{{ runner_group }}"
-        mode: "0755"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ runner_dir }}", mode: "0755" }
+        - { path: "{{ runner_work_dir }}", mode: "0755" }
+      tags:
+        - directories
 
-    - name: Download GitHub Actions Runner Release Package
+    - name: Download GitHub Actions Runner Release Archive
       get_url:
         url: "https://github.com/actions/runner/releases/download/v{{ runner_version }}/actions-runner-{{ runner_arch }}-{{ runner_version }}.tar.gz"
         dest: "/tmp/actions-runner-{{ runner_version }}.tar.gz"
         mode: "0644"
+        checksum: "{{ runner_checksum | default(omit) }}"
+      register: download_runner
+      until: download_runner is succeeded
+      retries: 3
+      delay: 5
+      tags:
+        - download
 
-    - name: Extract Actions Runner Package
+    - name: Extract Actions Runner Archive to Installation Directory
       unarchive:
         src: "/tmp/actions-runner-{{ runner_version }}.tar.gz"
         dest: "{{ runner_dir }}"
@@ -75,21 +164,41 @@
         owner: "{{ runner_user }}"
         group: "{{ runner_group }}"
         creates: "{{ runner_dir }}/run.sh"
+      tags:
+        - install
 
-    - name: Install Runner OS Dependencies
-      shell: "./bin/installdependencies.sh"
+    - name: Install Runner System OS Dependencies Script
+      command: "./bin/installdependencies.sh"
       args:
         chdir: "{{ runner_dir }}"
+      changed_when: false
       ignore_errors: yes
+      tags:
+        - install
 
-    - name: Configure GitHub Actions Runner
+    - name: Deploy Environment Configuration for Runner Daemon
+      copy:
+        dest: "{{ runner_dir }}/.env"
+        owner: "{{ runner_user }}"
+        group: "{{ runner_group }}"
+        mode: "0640"
+        content: |
+          # GitHub Actions Self-Hosted Runner Environment
+          RUNNER_NAME={{ runner_name }}
+          ACTIONS_RUNNER_SVC=1
+          DEBIAN_FRONTEND=noninteractive
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      tags:
+        - config
+
+    - name: Configure GitHub Actions Runner with GitHub Repository
       become_user: "{{ runner_user }}"
       shell: >
         ./config.sh --url {{ github_repo_url }}
         --token {{ runner_token }}
         --name {{ runner_name }}
         --labels {{ runner_labels }}
-        --work _work
+        --work {{ runner_work_dir }}
         --unattended
         --replace
       args:
@@ -98,8 +207,10 @@
       no_log: true
       when: runner_token != "YOUR_RUNNER_REGISTRATION_TOKEN"
       ignore_errors: yes
+      tags:
+        - registration
 
-    - name: Deploy Systemd Service for GitHub Actions Runner
+    - name: Deploy Hardened Systemd Service Unit for Runner Daemon
       copy:
         dest: /etc/systemd/system/github-actions-runner.service
         owner: root
@@ -107,25 +218,54 @@
         mode: "0644"
         content: |
           [Unit]
-          Description=GitHub Actions Self-Hosted Runner
-          After=network.target
+          Description=GitHub Actions Self-Hosted CI/CD Runner
+          Documentation=https://docs.github.com/en/actions/hosting-your-own-runners
+          After=network.target network-online.target docker.service
+          Wants=network-online.target
 
           [Service]
           ExecStart={{ runner_dir }}/run.sh
           User={{ runner_user }}
+          Group={{ runner_group }}
           WorkingDirectory={{ runner_dir }}
           KillMode=process
           KillSignal=SIGTERM
           TimeoutStopSec=5min
           Restart=always
           RestartSec=5s
+          LimitNOFILE=65536
+          LimitNPROC=4096
+          
+          # Systemd Security Hardening
+          NoNewPrivileges=true
+          ProtectSystem=full
+          ProtectControlGroups=true
+          ProtectKernelTunables=true
+          PrivateTmp=true
 
           [Install]
           WantedBy=multi-user.target
+      notify:
+        - Reload Systemd
+        - Restart Runner Service
+      tags:
+        - systemd
+        - service
 
-    - name: Reload Systemd Daemon
-      systemd:
-        daemon_reload: yes
+    - name: Flush Handlers to Ensure Systemd Reload
+      meta: flush_handlers
+
+    - name: Schedule Workspace Cleanup Routine to Avoid Disk Exhaustion
+      cron:
+        name: "Prune Old GitHub Actions Runner Workspace Artifacts"
+        minute: "30"
+        hour: "3"
+        job: "find {{ runner_work_dir }} -mindepth 2 -maxdepth 2 -type d -mtime +{{ workspace_cleanup_retention_days }} -exec rm -rf {} + > /dev/null 2>&1"
+        user: root
+        state: "{{ 'present' if enable_workspace_cleanup_cron | bool else 'absent' }}"
+      tags:
+        - maintenance
+        - cron
 
     - name: Ensure GitHub Actions Runner Service is Enabled and Started
       service:
@@ -134,8 +274,38 @@
         enabled: yes
       when: runner_token != "YOUR_RUNNER_REGISTRATION_TOKEN"
       ignore_errors: yes
+      tags:
+        - service
+
+    - name: Verify Runner Configuration File Exists
+      stat:
+        path: "{{ runner_dir }}/.runner"
+      register: runner_cfg_stat
+      tags:
+        - verification
 
     - name: Cleanup Downloaded Runner Archive
       file:
         path: "/tmp/actions-runner-{{ runner_version }}.tar.gz"
         state: absent
+      tags:
+        - cleanup
+
+    - name: Output GitHub Actions Runner Deployment Summary
+      debug:
+        msg:
+          - "=========================================================="
+          - "  GITHUB ACTIONS RUNNER DEPLOYMENT SUMMARY                "
+          - "=========================================================="
+          - "Runner Name          : {{ runner_name }}"
+          - "Runner Directory     : {{ runner_dir }}"
+          - "Workspace Directory  : {{ runner_work_dir }}"
+          - "Repository URL       : {{ github_repo_url }}"
+          - "Labels Configured    : {{ runner_labels }}"
+          - "Service Unit         : /etc/systemd/system/github-actions-runner.service"
+          - "Registration Status  : {{ 'Registered' if runner_cfg_stat.stat.exists else 'Token Pending / Placeholder' }}"
+          - "Toolchains Installed : Node.js, Git LFS, Docker Group, Build-Essentials"
+          - "Security Sandbox     : ProtectSystem=full, PrivateTmp=true, NoNewPrivileges=true"
+          - "=========================================================="
+      tags:
+        - summary
