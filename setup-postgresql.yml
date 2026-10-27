@@ -66,8 +66,26 @@
         - { regexp: "^#?checkpoint_completion_target\\s*=", line: "checkpoint_completion_target = {{ checkpoint_completion_target }}" }
         - { regexp: "^#?shared_preload_libraries\\s*=", line: "shared_preload_libraries = 'pg_stat_statements'" }
         - { regexp: "^#?password_encryption\\s*=", line: "password_encryption = scram-sha-256" }
+        - { regexp: "^#?wal_level\\s*=", line: "wal_level = replica" }
+        - { regexp: "^#?max_wal_size\\s*=", line: "max_wal_size = 4GB" }
+        - { regexp: "^#?min_wal_size\\s*=", line: "min_wal_size = 1GB" }
+        - { regexp: "^#?archive_mode\\s*=", line: "archive_mode = on" }
+        - { regexp: "^#?archive_command\\s*=", line: "archive_command = 'test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f'" }
+        - { regexp: "^#?autovacuum_max_workers\\s*=", line: "autovacuum_max_workers = 4" }
+        - { regexp: "^#?autovacuum_vacuum_scale_factor\\s*=", line: "autovacuum_vacuum_scale_factor = 0.05" }
+        - { regexp: "^#?autovacuum_analyze_scale_factor\\s*=", line: "autovacuum_analyze_scale_factor = 0.02" }
+        - { regexp: "^#?idle_in_transaction_session_timeout\\s*=", line: "idle_in_transaction_session_timeout = 60000" }
+        - { regexp: "^#?statement_timeout\\s*=", line: "statement_timeout = 300000" }
       notify: Restart PostgreSQL
       ignore_errors: yes
+
+    - name: Ensure PostgreSQL Local WAL Archive Directory Exists
+      file:
+        path: /var/lib/postgresql/archive
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
 
     - name: Flush Handlers to Apply Initial PostgreSQL Configuration
       meta: flush_handlers
