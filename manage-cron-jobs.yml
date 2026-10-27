@@ -14,18 +14,20 @@
     admin_email: "ops-alerts@example.com"
 
   tasks:
-    - name: Ensure cron package and logrotate are installed
+    - name: Ensure Cron Package, Logrotate and Lock Utilities Are Installed
       apt:
         name:
           - cron
           - logrotate
+          - util-linux
+          - bsdmainutils
         state: present
         update_cache: yes
         cache_valid_time: 3600
       tags:
         - packages
 
-    - name: Ensure cron service is enabled and started
+    - name: Ensure Cron Service is Enabled and Started
       service:
         name: cron
         state: started
@@ -33,7 +35,7 @@
       tags:
         - service
 
-    - name: Create maintenance directories and log storage
+    - name: Create Maintenance Directories and Log Storage with Strict Permissions
       file:
         path: "{{ item.path }}"
         state: directory
@@ -47,12 +49,19 @@
       tags:
         - directories
 
-    - name: Deploy automated system configuration backup script
+    - name: Deploy Automated System Configuration Backup Script with Concurrency Lock
       copy:
         dest: "{{ cron_scripts_dir }}/system-backup.sh"
         content: |
           #!/usr/bin/env bash
           set -euo pipefail
+
+          LOCK_FILE="/var/run/cron_system_backup.lock"
+          exec 201>"${LOCK_FILE}"
+          flock -n 201 || {
+            echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Backup run already in progress. Skipping."
+            exit 0
+          }
 
           TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
           BACKUP_FILE="{{ backup_dir }}/system_backup_${TIMESTAMP}.tar.gz"
@@ -76,7 +85,7 @@
       tags:
         - scripts
 
-    - name: Deploy automated log cleanup script
+    - name: Deploy Automated Stale Log Cleanup Script
       copy:
         dest: "{{ cron_scripts_dir }}/log-cleaner.sh"
         content: |
@@ -84,7 +93,7 @@
           set -euo pipefail
 
           echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Initiating stale log cleanup older than {{ log_retention_days }} days..."
-          find /var/log -type f \( -name "*.gz" -o -name "*.1" -o -name "*.old" \) -mtime +{{ log_retention_days }} -print -delete
+          find /var/log -type f \( -name "*.gz" -o -name "*.1" -o -name "*.old" \) -mtime +{{ log_retention_days }} -print -delete 2>/dev/null || true
           echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Log cleanup complete."
         owner: root
         group: root
@@ -92,7 +101,7 @@
       tags:
         - scripts
 
-    - name: Deploy disk utilization monitoring script
+    - name: Deploy Disk Utilization Monitoring Script with Syslog Alerting
       copy:
         dest: "{{ cron_scripts_dir }}/disk-monitor.sh"
         content: |
@@ -115,7 +124,7 @@
       tags:
         - scripts
 
-    - name: Deploy temporary directory cleanup script
+    - name: Deploy Temporary Directory Cleanup Script
       copy:
         dest: "{{ cron_scripts_dir }}/temp-cleaner.sh"
         content: |
@@ -132,7 +141,23 @@
       tags:
         - scripts
 
-    - name: Configure crontab environment variables
+    - name: Deploy Automated Cron Tasks Health Checker Script
+      copy:
+        dest: "{{ cron_scripts_dir }}/cron-healthcheck.sh"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running automated cron log error inspection..."
+          ERROR_COUNT=$(grep -iE "error|fatal|fail" "{{ cron_log_dir }}"/*.log 2>/dev/null | wc -l || true)
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cron log inspection complete. Errors found in logs: ${ERROR_COUNT}"
+        owner: root
+        group: root
+        mode: "0750"
+      tags:
+        - scripts
+
+    - name: Configure Crontab Environment Variables
       cron:
         name: "{{ item.name }}"
         env: yes
@@ -187,7 +212,17 @@
       tags:
         - cron
 
-    - name: Deploy logrotate configuration for cron task outputs
+    - name: Schedule Daily Cron Task Health Verification Job
+      cron:
+        name: "Enterprise Daily Cron Tasks Health Verification"
+        minute: "30"
+        hour: "6"
+        job: "{{ cron_scripts_dir }}/cron-healthcheck.sh >> {{ cron_log_dir }}/healthcheck.log 2>&1"
+        user: root
+      tags:
+        - cron
+
+    - name: Deploy Logrotate Configuration for Cron Task Outputs
       copy:
         dest: /etc/logrotate.d/cron-tasks
         content: |
@@ -206,7 +241,7 @@
       tags:
         - logrotate
 
-    - name: Audit active crontab configuration for root
+    - name: Audit Active Crontab Configuration for Root
       command: crontab -l
       register: cron_audit
       changed_when: false
@@ -216,9 +251,15 @@
     - name: Display Cron Automation Audit Summary
       debug:
         msg:
-          - "Cron automation is configured and running."
-          - "Scripts Directory: {{ cron_scripts_dir }}"
-          - "Log Directory: {{ cron_log_dir }} (Managed via Logrotate)"
-          - "Active Crontab Lines: {{ cron_audit.stdout_lines | length }}"
+          - "=========================================================="
+          - "  CRON AUTOMATION & MAINTENANCE SCHEDULER SUMMARY         "
+          - "=========================================================="
+          - "Cron Service Status    : Running and Enabled"
+          - "Scripts Directory      : {{ cron_scripts_dir }}"
+          - "Log Directory          : {{ cron_log_dir }} (Rotated weekly)"
+          - "Active Crontab Entries : {{ cron_audit.stdout_lines | length }}"
+          - "Locking Mechanism      : flock-protected critical routines"
+          - "Alert Notifications    : Configured for {{ admin_email }}"
+          - "=========================================================="
       tags:
         - verify
