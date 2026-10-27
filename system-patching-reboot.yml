@@ -131,16 +131,48 @@
         - postflight
         - verify
 
+    - name: Audit processes requiring restart via needrestart
+      command: needrestart -b
+      register: needrestart_audit
+      changed_when: false
+      failed_when: false
+      tags:
+        - postflight
+        - verify
+
+    - name: Write Machine-Readable Patching Audit Manifest
+      copy:
+        dest: /var/log/patching-manifest.json
+        content: |
+          {
+            "node": "{{ ansible_hostname }}",
+            "distribution": "{{ ansible_distribution }} {{ ansible_distribution_version }}",
+            "kernel_initial": "{{ pre_patch_kernel }}",
+            "kernel_active": "{{ ansible_kernel }}",
+            "reboot_performed": {{ 'true' if reboot_required_file.stat.exists else 'false' }},
+            "packages_updated": {{ 'true' if apt_upgrade_res.changed else 'false' }},
+            "failed_systemd_units": {{ post_failed_services.stdout_lines | default([]) | to_json }},
+            "timestamp": "{{ ansible_date_time.iso8601 }}"
+          }
+        owner: root
+        group: root
+        mode: "0640"
+      tags:
+        - audit
+        - manifest
+
     - name: Display comprehensive OS patching and health audit summary
       debug:
         msg:
-          - "================= [ PATCHING SUMMARY ] ================="
-          - "Host: {{ ansible_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
-          - "Kernel Before: {{ pre_patch_kernel }} | Current Kernel: {{ ansible_kernel }}"
-          - "Reboot Executed: {{ reboot_required_file.stat.exists }}"
-          - "Packages Upgraded: {{ 'Yes' if apt_upgrade_res.changed else 'None (Already up-to-date)' }}"
-          - "Post-Patch Failed Units: {{ post_failed_services.stdout_lines | length if post_failed_services.stdout else 0 }}"
-          - "Audit log written to: {{ patching_log_path }}"
-          - "========================================================"
+          - "=========================================================="
+          - "  ENTERPRISE OS FLEET PATCHING & HEALTH AUDIT SUMMARY     "
+          - "=========================================================="
+          - "Target Host          : {{ ansible_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+          - "Kernel Before/After  : {{ pre_patch_kernel }} -> {{ ansible_kernel }}"
+          - "Reboot Executed      : {{ 'YES' if reboot_required_file.stat.exists else 'NO (Kernel unchanged)' }}"
+          - "Packages Upgraded    : {{ 'YES (dist-upgrade complete)' if apt_upgrade_res.changed else 'NO (Up to date)' }}"
+          - "Failed Systemd Units : {{ post_failed_services.stdout_lines | length if post_failed_services.stdout else 0 }}"
+          - "Audit Manifest Path  : /var/log/patching-manifest.json"
+          - "=========================================================="
       tags:
         - verify
