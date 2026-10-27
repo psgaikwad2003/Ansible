@@ -202,21 +202,71 @@
         state: started
         enabled: yes
 
+    - name: Deploy Enterprise Legal Warning Banner
+      copy:
+        dest: /etc/issue.net
+        content: |
+          *************************************************************************
+          *                             AUTHORIZED ACCESS ONLY                    *
+          *                                                                       *
+          * All activities on this system are logged and monitored. Unauthorized  *
+          * access or misuse will result in administrative discipline and civil   *
+          * and/or criminal prosecution under applicable cybersecurity laws.      *
+          *************************************************************************
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable Legal Warning Banner in SSH Daemon Configuration
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?Banner"
+        line: "Banner /etc/issue.net"
+        state: present
+      notify: Restart SSH
+
+    - name: Audit Authorized Keys Permissions Across System Users
+      shell: "find /home /root -maxdepth 3 -name 'authorized_keys' -exec chmod 0600 {} + 2>/dev/null || true"
+      changed_when: false
+      tags:
+        - permissions
+
     - name: Verify SSH Configuration Syntax
       command: /usr/sbin/sshd -t
       register: sshd_syntax_check
       changed_when: false
       failed_when: false
+      tags:
+        - verify
 
-    - name: Display SSH Security Hardening Summary
+    - name: Inspect Active SSH Listening Sockets
+      shell: "ss -tulpn | grep -E ':{{ ssh_port }}\\b' || true"
+      register: ssh_port_audit
+      changed_when: false
+      tags:
+        - verify
+
+    - name: Display Comprehensive SSH Security Hardening Summary
       debug:
         msg:
-          - "SSH Port: {{ ssh_port }}"
-          - "PermitRootLogin: no"
-          - "PasswordAuthentication: no"
-          - "Allowed Users: {{ allowed_users | join(', ') }}"
-          - "Fail2Ban Protection: Enabled on port {{ ssh_port }}"
-          - "Syntax check status: {{ 'Passed' if sshd_syntax_check.rc == 0 else 'Notice: syntax test returned non-zero in this environment' }}"
+          - "=========================================================="
+          - "  OPENSSH SECURITY & FAIL2BAN HARDENING AUDIT             "
+          - "=========================================================="
+          - "Hardened SSH Port    : {{ ssh_port }}"
+          - "Root Login           : STRICTLY FORBIDDEN (no)"
+          - "Password Auth        : DISABLED (Public Key Auth Only)"
+          - "Allowed Users        : {{ allowed_users | join(', ') }}"
+          - "Cipher Suite         : ChaCha20-Poly1305 / AES-GCM / AES-CTR"
+          - "KEX Algorithms       : Curve25519 / Diffie-Hellman Group 16/18"
+          - "MAC Algorithms       : Encrypt-then-MAC (EtM)"
+          - "Port Forwarding      : DISABLED"
+          - "Legal Security Banner: /etc/issue.net Active"
+          - "Fail2Ban Jail Active : Yes ({{ fail2ban_bantime }} ban upon {{ fail2ban_maxretry }} retries)"
+          - "Syntax Validation    : {{ 'PASSED' if sshd_syntax_check.rc == 0 else 'CHECK REQUIRED' }}"
+          - "Listening Socket     : {{ ssh_port_audit.stdout | default('Standby for restart') }}"
+          - "=========================================================="
+      tags:
+        - verify
 
   handlers:
     - name: Restart SSH
