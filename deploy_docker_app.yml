@@ -140,24 +140,55 @@
         - verify
         - health
 
-    - name: Audit active container resource metrics and status
-      command: "docker inspect --format '{% raw %}Status: {{.State.Status}} | PID: {{.State.Pid}} | IP: {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}{% endraw %}' {{ app_container_name }}"
-      register: container_audit
+    - name: Verify host HTTP ingress endpoint responsiveness
+      command: "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ app_host_port }}/"
+      register: http_probe_res
+      retries: 5
+      delay: 2
+      until: http_probe_res.stdout in ['200', '301', '302', '404']
       changed_when: false
+      failed_when: false
       tags:
         - verify
+        - health
+
+    - name: Deploy Container Runtime Manifest Record
+      copy:
+        dest: /var/log/docker-container-manifest.json
+        content: |
+          {
+            "container_name": "{{ app_container_name }}",
+            "image": "{{ app_image_name }}:{{ app_image_tag }}",
+            "host_port": {{ app_host_port }},
+            "container_port": {{ app_container_port }},
+            "network": "{{ app_network_name }}",
+            "cpus": "{{ container_cpu_limit }}",
+            "memory": "{{ container_memory_limit }}",
+            "deployed_node": "{{ ansible_hostname }}",
+            "deployed_at": "{{ ansible_date_time.iso8601 }}"
+          }
+        owner: root
+        group: root
+        mode: "0640"
+      tags:
+        - manifest
 
     - name: Display Container Production Deployment Summary
       debug:
         msg:
-          - "================ CONTAINER DEPLOYMENT AUDIT ================"
+          - "=========================================================="
+          - "  ENTERPRISE DOCKER CONTAINER DEPLOYMENT AUDIT            "
+          - "=========================================================="
           - "Container Name   : {{ app_container_name }}"
-          - "Image            : {{ app_image_name }}:{{ app_image_tag }}"
-          - "Host Port Map    : 0.0.0.0:{{ app_host_port }} -> {{ app_container_port }}"
+          - "Image Tag        : {{ app_image_name }}:{{ app_image_tag }}"
+          - "Ingress Port Map : 0.0.0.0:{{ app_host_port }} -> {{ app_container_port }}"
           - "Resource Quotas  : CPUs: {{ container_cpu_limit }} | Max Mem: {{ container_memory_limit }}"
-          - "Healthcheck      : {{ health_inspect.stdout | default('Active') }}"
+          - "Security Profile : cap-drop ALL, no-new-privileges, tmpfs isolations"
+          - "Health Status    : {{ health_inspect.stdout | default('Active') }}"
+          - "HTTP Probe Code  : {{ http_probe_res.stdout | default('N/A') }}"
           - "Runtime Details  : {{ container_audit.stdout }}"
-          - "============================================================"
+          - "Manifest Path    : /var/log/docker-container-manifest.json"
+          - "=========================================================="
       tags:
         - verify
         - report
