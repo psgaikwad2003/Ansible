@@ -131,6 +131,55 @@
       loop: "{{ redis_rename_dangerous_commands }}"
       notify: Restart Redis
 
+    - name: Configure Redis Active Memory Defragmentation
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: "^#?activedefrag ", line: "activedefrag yes" }
+        - { regexp: "^#?active-defrag-ignore-bytes ", line: "active-defrag-ignore-bytes 100mb" }
+        - { regexp: "^#?active-defrag-threshold-lower ", line: "active-defrag-threshold-lower 10" }
+        - { regexp: "^#?active-defrag-threshold-upper ", line: "active-defrag-threshold-upper 30" }
+      notify: Restart Redis
+
+    - name: Configure Dedicated Redis ACL Users Policy File
+      copy:
+        dest: /etc/redis/users.acl
+        content: |
+          user default on #{{ redis_password }} ~* &* +@all
+          user app_reader on >AppReadOnlyPass@2026 ~* &* +@read -@write -@dangerous
+        owner: redis
+        group: redis
+        mode: "0600"
+      notify: Restart Redis
+
+    - name: Enable ACL File in Redis Configuration
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^#?aclfile "
+        line: "aclfile /etc/redis/users.acl"
+        state: present
+      notify: Restart Redis
+
+    - name: Configure Systemd Resource Limits Override for Redis
+      file:
+        path: /etc/systemd/system/redis-server.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Deploy Redis Systemd LimitNOFILE Override
+      copy:
+        dest: /etc/systemd/system/redis-server.service.d/override.conf
+        content: |
+          [Service]
+          LimitNOFILE=65535
+        mode: "0644"
+      notify:
+        - Reload Systemd Daemon
+        - Restart Redis
+
     - name: Ensure Redis Service is Started and Enabled
       service:
         name: redis-server
@@ -155,12 +204,23 @@
     - name: Display Redis Health and Memory Status
       debug:
         msg:
-          - "Redis PING check: {{ redis_ping_result.stdout | default('Skipped / Offline') }}"
-          - "Listening on: {{ redis_bind_interface }}:{{ redis_port }}"
-          - "Max Memory: {{ redis_max_memory }} (Policy: {{ redis_max_memory_policy }})"
-          - "AOF Persistence: {{ redis_appendonly }} (Sync: {{ redis_appendfsync }})"
+          - "=========================================================="
+          - "  REDIS IN-MEMORY CACHE ENTERPRISE AUDIT SUMMARY          "
+          - "=========================================================="
+          - "Endpoint             : {{ redis_bind_interface }}:{{ redis_port }}"
+          - "Max Memory & Policy  : {{ redis_max_memory }} ({{ redis_max_memory_policy }})"
+          - "AOF Persistence      : {{ redis_appendonly }} (Sync: {{ redis_appendfsync }})"
+          - "Active Defrag        : Enabled (10% - 30% Threshold)"
+          - "ACL Security Policy  : Active in /etc/redis/users.acl"
+          - "Ulimit NOFILE        : 65,535 (systemd override)"
+          - "PING Check Result    : {{ redis_ping_result.stdout | default('Skipped / Offline') }}"
+          - "=========================================================="
 
   handlers:
+    - name: Reload Systemd Daemon
+      systemd:
+        daemon_reload: yes
+
     - name: Restart Redis
       service:
         name: redis-server
