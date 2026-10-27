@@ -158,25 +158,101 @@
         - config
         - template
 
+    - name: Deploy dynamic environment variable export snippet
+      copy:
+        dest: "{{ config_dir }}/environment.env"
+        content: |
+          # Environment variables for {{ app_name }}
+          NODE_ENV={{ app_environment }}
+          APP_PORT={{ app_port }}
+          APP_HOST={{ app_host }}
+          WORKER_COUNT={{ env_profiles[app_environment].workers | default(app_workers) }}
+          DB_URL=postgresql://{{ database.user }}@{{ database.host }}:{{ database.port }}/{{ database.name }}
+          REDIS_URL=redis://{{ cache.redis_host }}:{{ cache.redis_port }}
+        owner: root
+        group: root
+        mode: "0600"
+      tags:
+        - config
+
+    - name: Deploy production systemd unit template for application service
+      copy:
+        dest: "/etc/systemd/system/{{ app_name }}.service"
+        content: |
+          [Unit]
+          Description={{ app_name | upper }} Microservice Daemon
+          After=network.target postgresql.service redis.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=www-data
+          Group=www-data
+          WorkingDirectory={{ config_dir }}
+          EnvironmentFile={{ config_dir }}/environment.env
+          ExecStart=/usr/bin/python3 -m http.server {{ app_port }} --bind {{ app_host }}
+          Restart=always
+          RestartSec=5s
+          LimitNOFILE=65535
+
+          # Systemd Sandboxing Protections
+          ProtectSystem=strict
+          ProtectHome=yes
+          NoNewPrivileges=yes
+          PrivateTmp=yes
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload Systemd Daemon
+        - Restart Application Service
+      tags:
+        - systemd
+        - service
+
     - name: Validate rendered configuration file integrity
       stat:
         path: "{{ config_dir }}/app.conf"
         get_checksum: yes
       register: conf_stat
-      failed_when: not conf_stat.stat.exists
+      failed_when: not conf_stat.stat.exists or conf_stat.stat.size == 0
       tags:
         - verify
 
-    - name: Display Configuration Rendering Status
+    - name: Audit configuration lines and parameter density
+      shell: "grep -c '=' {{ config_dir }}/app.conf"
+      register: param_count
+      changed_when: false
+      failed_when: false
+      tags:
+        - verify
+
+    - name: Display Configuration Rendering Status & Telemetry
       debug:
         msg:
-          - "Application config deployed to: {{ config_dir }}/app.conf"
-          - "File size: {{ conf_stat.stat.size }} bytes | SHA1: {{ conf_stat.stat.checksum }}"
-          - "Active features: {{ feature_flags | selectattr('enabled') | map(attribute='name') | list }}"
+          - "=========================================================="
+          - "  JINJA2 TEMPLATE ORCHESTRATION SUMMARY                   "
+          - "=========================================================="
+          - "Config File Path     : {{ config_dir }}/app.conf"
+          - "Environment Profile  : {{ app_environment | upper }}"
+          - "File Size (bytes)    : {{ conf_stat.stat.size }}"
+          - "File SHA1 Checksum   : {{ conf_stat.stat.checksum }}"
+          - "Parameters Count    : {{ param_count.stdout | default('N/A') }}"
+          - "Upstream Services    : {{ upstream_services | map(attribute='name') | join(', ') }}"
+          - "Active Feature Flags : {{ feature_flags | selectattr('enabled') | map(attribute='name') | list }}"
+          - "Systemd Service Unit : /etc/systemd/system/{{ app_name }}.service"
+          - "=========================================================="
       tags:
         - verify
 
   handlers:
+    - name: Reload Systemd Daemon
+      systemd:
+        daemon_reload: yes
+
     - name: Restart Application Service
       service:
         name: "{{ app_name }}"
