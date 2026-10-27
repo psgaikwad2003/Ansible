@@ -122,21 +122,60 @@
         - web
         - deploy
 
-    - name: Deploy custom 404 error page
+    - name: Deploy custom 404 Not Found error page
       copy:
         dest: "{{ web_root_dir }}/404.html"
         content: |
           <!DOCTYPE html>
-          <html><head><title>404 Not Found</title></head>
-          <body style="font-family:sans-serif;text-align:center;padding:50px;">
-          <h1>404 - Page Not Found</h1>
-          <p>The requested resource could not be located on this server.</p>
-          </body></html>
+          <html lang="en">
+          <head><meta charset="UTF-8"><title>404 Not Found</title>
+          <style>body{font-family:sans-serif;background:#0f172a;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}
+          .box{text-align:center;padding:2rem;background:#1e293b;border-radius:12px;border:1px solid #334155;}
+          h1{color:#f43f5e;}</style></head>
+          <body><div class="box"><h1>404 - Not Found</h1><p>The requested endpoint could not be resolved on this host.</p></div></body></html>
         owner: "{{ web_user }}"
         group: "{{ web_group }}"
         mode: "0644"
       tags:
         - web
+
+    - name: Deploy custom 500 and 503 Gateway Error templates
+      copy:
+        dest: "{{ web_root_dir }}/{{ item.file }}"
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="UTF-8"><title>{{ item.code }} {{ item.title }}</title>
+          <style>body{font-family:sans-serif;background:#0f172a;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}
+          .box{text-align:center;padding:2rem;background:#1e293b;border-radius:12px;border:1px solid #334155;}
+          h1{color:#eab308;}</style></head>
+          <body><div class="box"><h1>{{ item.code }} - {{ item.title }}</h1><p>{{ item.desc }}</p></div></body></html>
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0644"
+      loop:
+        - { file: "500.html", code: "500", title: "Internal Server Error", desc: "Our engineering operations team has been notified." }
+        - { file: "503.html", code: "503", title: "Service Temporarily Unavailable", desc: "Upstream cluster is undergoing maintenance. Please retry shortly." }
+      tags:
+        - web
+
+    - name: Deploy enterprise scheduled maintenance page
+      copy:
+        dest: "{{ web_root_dir }}/maintenance/index.html"
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="UTF-8"><title>Planned Maintenance</title>
+          <style>body{font-family:sans-serif;background:#0f172a;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}
+          .box{max-width:500px;text-align:center;padding:2.5rem;background:#1e293b;border-radius:12px;border:1px solid #38bdf8;}
+          h1{color:#38bdf8;}</style></head>
+          <body><div class="box"><h1>Scheduled Maintenance</h1><p>We are currently upgrading server systems. Services will resume shortly.</p></div></body></html>
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0644"
+      tags:
+        - web
+        - maintenance
 
     - name: Deploy search engine robots.txt
       copy:
@@ -145,23 +184,70 @@
           User-agent: *
           Disallow: /admin/
           Disallow: /private/
+          Disallow: /maintenance/
+          Allow: /
         owner: "{{ web_user }}"
         group: "{{ web_group }}"
         mode: "0644"
       tags:
         - web
 
-    - name: Verify static asset deployment and calculate checksum
+    - name: Generate static asset deployment manifest
+      copy:
+        dest: "{{ web_root_dir }}/asset_manifest.json"
+        content: |
+          {
+            "release_version": "{{ release_version }}",
+            "environment": "{{ site_environment }}",
+            "deployed_node": "{{ ansible_hostname }}",
+            "deployed_by": "Ansible Automation Engine",
+            "deployed_at": "{{ ansible_date_time.iso8601 }}",
+            "managed_assets": [
+              "index.html",
+              "healthz",
+              "404.html",
+              "500.html",
+              "503.html",
+              "maintenance/index.html",
+              "robots.txt"
+            ]
+          }
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0644"
+      tags:
+        - web
+        - manifest
+
+    - name: Verify static asset deployment and calculate checksums
       stat:
         path: "{{ web_root_dir }}/index.html"
         get_checksum: yes
       register: index_stat
+      failed_when: not index_stat.stat.exists or index_stat.stat.size == 0
       tags:
         - verify
 
-    - name: Display asset deployment status
+    - name: Audit asset inventory file count
+      shell: "find {{ web_root_dir }} -type f | wc -l"
+      register: asset_count
+      changed_when: false
+      tags:
+        - verify
+
+    - name: Display Asset Deployment Telemetry & Audit Summary
       debug:
-        msg: "Asset index.html deployed successfully. SHA1: {{ index_stat.stat.checksum }}, Size: {{ index_stat.stat.size }} bytes."
+        msg:
+          - "=========================================================="
+          - "  STATIC WEB ASSET DEPLOYMENT AUDIT SUMMARY               "
+          - "=========================================================="
+          - "Document Root    : {{ web_root_dir }}"
+          - "Active Release   : {{ release_version }} ({{ site_environment }})"
+          - "Index File Size  : {{ index_stat.stat.size }} bytes"
+          - "Index SHA1 Hash  : {{ index_stat.stat.checksum }}"
+          - "Total Web Assets : {{ asset_count.stdout | trim }} files verified"
+          - "Asset Manifest   : {{ web_root_dir }}/asset_manifest.json"
+          - "=========================================================="
       tags:
         - verify
 
