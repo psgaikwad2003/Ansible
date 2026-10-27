@@ -137,6 +137,35 @@
         - firewall
         - logging
 
+    - name: Deploy Custom UFW Application Profiles Manifest
+      copy:
+        dest: /etc/ufw/applications.d/cluster-apps
+        content: |
+          [Web-Production]
+          title=Production Web Stack
+          description=Standard HTTP and HTTPS Ingress
+          ports=80,443/tcp
+
+          [Prometheus-Metrics]
+          title=Prometheus Metrics Node Exporter
+          description=Telemetry Scrape Endpoint
+          ports=9100/tcp
+        owner: root
+        group: root
+        mode: "0644"
+      tags:
+        - firewall
+        - profiles
+
+    - name: Ensure IPv6 Traffic Filtering is Enforced in UFW Defaults
+      lineinfile:
+        path: /etc/default/ufw
+        regexp: "^IPV6="
+        line: "IPV6=yes"
+        state: present
+      tags:
+        - firewall
+
     - name: Enable UFW firewall service and enforce ruleset
       ufw:
         state: enabled
@@ -144,15 +173,18 @@
         - firewall
         - service
 
-    - name: Query active firewall status
+    - name: Query active firewall status and numbered rule table
       command: ufw status verbose
       register: ufw_status_output
       changed_when: false
       tags:
         - verify
 
-    - name: Inspect connection tracking table statistics
-      shell: "sysctl net.netfilter.nf_conntrack_count 2>/dev/null || echo 'N/A'"
+    - name: Inspect connection tracking table statistics and limit
+      shell: |
+        COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "0")
+        MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "0")
+        echo "Active Connections: ${COUNT} / Max: ${MAX}"
       register: conntrack_status
       changed_when: false
       tags:
@@ -162,14 +194,17 @@
     - name: Display Active Firewall Configuration & Audit Report
       debug:
         msg:
-          - "================ UFW FIREWALL AUDIT ================"
-          - "Default Policies  : Incoming: {{ firewall_default_incoming }} | Outgoing: {{ firewall_default_outgoing }}"
-          - "SSH Rate Limiting : {{ 'Enabled' if enable_ssh_rate_limiting else 'Disabled' }} (Port {{ ssh_port }})"
-          - "Logging Level     : {{ firewall_logging_level }}"
-          - "Conntrack Count   : {{ conntrack_status.stdout }}"
-          - "Active Rules:"
-          - "{{ ufw_status_output.stdout_lines }}"
-          - "==================================================="
+          - "=========================================================="
+          - "  ENTERPRISE UFW FIREWALL & NETWORK SECURITY AUDIT        "
+          - "=========================================================="
+          - "Default Incoming Policy : {{ firewall_default_incoming | upper }}"
+          - "Default Outgoing Policy : {{ firewall_default_outgoing | upper }}"
+          - "Loopback Interface (lo) : Full Bidirectional Allow"
+          - "SSH Rate Limiting       : {{ 'ACTIVE (Port ' ~ ssh_port ~ ')' if enable_ssh_rate_limiting else 'Disabled' }}"
+          - "Security Logging Level  : {{ firewall_logging_level }}"
+          - "Kernel Conntrack Status : {{ conntrack_status.stdout | trim }}"
+          - "Application Profiles    : /etc/ufw/applications.d/cluster-apps"
+          - "=========================================================="
       tags:
         - verify
         - report
