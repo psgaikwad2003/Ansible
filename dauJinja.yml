@@ -13,13 +13,50 @@
     log_level: "INFO"
     config_dir: "/etc/myapp"
 
+    # Multi-environment configuration profiles
+    env_profiles:
+      production:
+        workers: 8
+        timeout_seconds: 60
+        debug: false
+        enable_telemetry: true
+      staging:
+        workers: 4
+        timeout_seconds: 120
+        debug: true
+        enable_telemetry: true
+      development:
+        workers: 2
+        timeout_seconds: 300
+        debug: true
+        enable_telemetry: false
+
+    # Upstream Microservice Endpoints
+    upstream_services:
+      - name: auth-service
+        url: "http://10.0.0.31:8081"
+        timeout_ms: 1500
+        critical: true
+      - name: payment-gateway
+        url: "https://api.payment.internal:8443"
+        timeout_ms: 3000
+        critical: true
+      - name: notification-worker
+        url: "http://10.0.0.32:8082"
+        timeout_ms: 5000
+        critical: false
+
     # Database Configuration Object
     database:
       host: "10.0.0.10"
       port: 5432
       name: "myapp_prod"
+      user: "app_rw"
       max_connections: 50
+      min_idle_connections: 10
       connection_timeout_sec: 30
+      ssl_mode: "verify-full"
+      ssl_root_cert: "/etc/ssl/certs/internal-ca.crt"
 
     # Cache Configuration
     cache:
@@ -27,16 +64,27 @@
       backend: "redis"
       redis_host: "10.0.0.20"
       redis_port: 6379
+      cluster_mode: false
       ttl_seconds: 3600
+      max_memory_policy: "volatile-lru"
 
     # Dynamic Feature Toggles
     feature_flags:
       - name: "enable_new_auth_flow"
         enabled: true
+        rollout_percentage: 100
       - name: "maintenance_mode"
         enabled: false
+        rollout_percentage: 0
       - name: "metrics_collection"
         enabled: true
+        rollout_percentage: 100
+      - name: "dark_mode_v2"
+        enabled: true
+        rollout_percentage: 50
+      - name: "graphql_api_gateway"
+        enabled: true
+        rollout_percentage: 25
 
   tasks:
     - name: Ensure application configuration directory exists
@@ -63,7 +111,10 @@
           [server]
           bind_host = {{ app_host }}
           port = {{ app_port }}
-          workers = {{ app_workers }}
+          workers = {{ env_profiles[app_environment].workers | default(app_workers) }}
+          request_timeout = {{ env_profiles[app_environment].timeout_seconds | default(60) }}
+          debug_mode = {{ 'true' if env_profiles[app_environment].debug else 'false' }}
+          telemetry_enabled = {{ 'true' if env_profiles[app_environment].enable_telemetry else 'false' }}
           environment = {{ app_environment }}
           log_level = {{ log_level }}
 
@@ -71,18 +122,32 @@
           host = {{ database.host }}
           port = {{ database.port }}
           database_name = {{ database.name }}
+          username = {{ database.user }}
           max_connections = {{ database.max_connections }}
+          min_idle = {{ database.min_idle_connections }}
           connection_timeout = {{ database.connection_timeout_sec }}
+          ssl_mode = {{ database.ssl_mode }}
+          ssl_root_cert = {{ database.ssl_root_cert }}
 
           [cache]
           enabled = {{ 'true' if cache.enabled else 'false' }}
           backend = {{ cache.backend }}
           redis_endpoint = {{ cache.redis_host }}:{{ cache.redis_port }}
+          cluster_mode = {{ 'true' if cache.cluster_mode else 'false' }}
           cache_ttl = {{ cache.ttl_seconds }}
+          eviction_policy = {{ cache.max_memory_policy }}
+
+          [upstreams]
+          {% for svc in upstream_services %}
+          upstream_{{ svc.name | replace('-', '_') }}_url = {{ svc.url }}
+          upstream_{{ svc.name | replace('-', '_') }}_timeout = {{ svc.timeout_ms }}ms
+          upstream_{{ svc.name | replace('-', '_') }}_critical = {{ 'true' if svc.critical else 'false' }}
+          {% endfor %}
 
           [features]
           {% for feature in feature_flags %}
           feature_{{ feature.name }} = {{ 'true' if feature.enabled else 'false' }}
+          feature_{{ feature.name }}_rollout = {{ feature.rollout_percentage }}%
           {% endfor %}
         owner: root
         group: root
