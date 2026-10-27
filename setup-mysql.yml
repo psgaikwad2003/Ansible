@@ -180,6 +180,19 @@
         - database
         - user
 
+    - name: Provision Dedicated Automated Backup Operator User with Scoped Privileges
+      mysql_user:
+        name: backup_operator
+        password: "{{ db_password }}"
+        priv: "*.*:SELECT,RELOAD,LOCK TABLES,REPLICATION CLIENT,SHOW VIEW,PROCESS"
+        host: localhost
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      tags:
+        - database
+        - backup
+
     - name: Configure UFW firewall rule for MySQL port
       ufw:
         rule: allow
@@ -199,13 +212,29 @@
       tags:
         - verify
 
-    - name: Display MySQL deployment audit summary
+    - name: Collect MySQL Performance and Runtime Telemetry
+      command: mysqladmin --defaults-file=/root/.my.cnf status
+      register: mysql_status_metrics
+      changed_when: false
+      failed_when: false
+      tags:
+        - verify
+
+    - name: Display MySQL Enterprise Deployment Audit Summary
       debug:
         msg:
-          - "MySQL Server is healthy and listening on {{ mysql_bind_address }}:{{ mysql_port }}."
-          - "Target Database: {{ db_name }} ({{ db_encoding }}/{{ db_collation }})."
-          - "Application User: {{ db_user }} configured with scoped access."
-          - "Ping status: {{ mysql_ping_res.stdout }}"
+          - "=========================================================="
+          - "  MYSQL ENTERPRISE DATABASE HARDENING & AUDIT SUMMARY     "
+          - "=========================================================="
+          - "Listen Endpoint      : {{ mysql_bind_address }}:{{ mysql_port }}"
+          - "Target Database      : {{ db_name }} ({{ db_encoding }}/{{ db_collation }})"
+          - "Application Account  : {{ db_user }} (Scoped to {{ db_name }}.*)"
+          - "Backup Operator      : backup_operator (Least-privilege backup role)"
+          - "InnoDB Buffer Pool   : {{ mysql_innodb_buffer_pool_size }}"
+          - "Slow Query Logging   : Enabled (Threshold: {{ mysql_long_query_time }}s)"
+          - "Ping Health Status   : {{ mysql_ping_res.stdout }}"
+          - "Server Telemetry     : {{ mysql_status_metrics.stdout | default('N/A') }}"
+          - "=========================================================="
       tags:
         - verify
 
