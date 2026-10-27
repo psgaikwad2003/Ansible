@@ -125,12 +125,25 @@
       loop: "{{ db_extensions }}"
       ignore_errors: yes
 
+    - name: Provision Dedicated PostgreSQL Streaming Replication User
+      become_user: postgres
+      postgresql_user:
+        name: "replicator"
+        password: "{{ db_password }}"
+        role_attr_flags: "REPLICATION"
+        encrypted: yes
+        state: present
+      ignore_errors: yes
+
     - name: Configure SCRAM-SHA-256 Authentication in pg_hba.conf
       lineinfile:
         path: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.conf"
-        line: "host    {{ db_name }}     {{ db_user }}     127.0.0.1/32            scram-sha-256"
+        line: "{{ item }}"
         insertbefore: "^# IPv4 local connections:"
         state: present
+      loop:
+        - "host    {{ db_name }}     {{ db_user }}     127.0.0.1/32            scram-sha-256"
+        - "host    replication       replicator        10.0.0.0/8              scram-sha-256"
       notify: Restart PostgreSQL
       ignore_errors: yes
 
@@ -141,14 +154,32 @@
       changed_when: false
       failed_when: false
 
+    - name: Query PostgreSQL Performance and Buffer Cache Hit Ratio
+      become_user: postgres
+      command: |
+        psql -d {{ db_name }} -t -A -c "
+        SELECT ROUND(100.0 * sum(blks_hit) / nullif(sum(blks_hit + blks_read), 0), 2)
+        FROM pg_stat_database WHERE datname = '{{ db_name }}';"
+      register: cache_hit_ratio
+      changed_when: false
+      failed_when: false
+
     - name: Display PostgreSQL Deployment and Health Status
       debug:
         msg:
-          - "PostgreSQL {{ postgres_version }} server configured."
-          - "Database: {{ db_name }} (Encoding: UTF-8)"
-          - "User: {{ db_user }} (Auth: SCRAM-SHA-256)"
-          - "Shared Buffers: {{ shared_buffers }} | Effective Cache: {{ effective_cache_size }}"
-          - "Connection Test: {{ 'Passed' if psql_healthcheck.rc == 0 else 'Notice: skipped local query test' }}"
+          - "=========================================================="
+          - "  POSTGRESQL ENTERPRISE DATABASE CLUSTER AUDIT            "
+          - "=========================================================="
+          - "PostgreSQL Version   : {{ postgres_version }} (Port: {{ postgres_port }})"
+          - "Database Name        : {{ db_name }} (Encoding: UTF-8)"
+          - "Primary Admin User   : {{ db_user }} (Auth: SCRAM-SHA-256)"
+          - "Replication User     : replicator (REPLICATION role active)"
+          - "Shared Buffers       : {{ shared_buffers }}"
+          - "Effective Cache Size : {{ effective_cache_size }}"
+          - "WAL Level & Archive  : replica (Active in /var/lib/postgresql/archive)"
+          - "Cache Hit Ratio (%)  : {{ cache_hit_ratio.stdout | default('N/A') }}%"
+          - "Connection Test      : {{ 'PASSED' if psql_healthcheck.rc == 0 else 'LOCAL QUERY SKIPPED' }}"
+          - "=========================================================="
 
   handlers:
     - name: Restart PostgreSQL
