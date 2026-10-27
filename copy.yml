@@ -12,18 +12,43 @@
     site_environment: "Production"
     release_version: "v1.4.0"
     enable_backup: yes
+    asset_subdirs:
+      - assets/css
+      - assets/js
+      - assets/images
+      - maintenance
+      - .well-known
 
   tasks:
-    - name: Ensure web document root directory exists
+    - name: Ensure web document root and asset subdirectories exist with strict ownership
       file:
-        path: "{{ web_root_dir }}"
+        path: "{{ web_root_dir }}/{{ item }}"
         state: directory
         owner: "{{ web_user }}"
         group: "{{ web_group }}"
         mode: "0755"
+      loop:
+        - ""
+        - assets/css
+        - assets/js
+        - assets/images
+        - maintenance
+        - .well-known
       tags:
         - web
         - setup
+
+    - name: Deploy cluster healthz endpoint for ingress load balancers
+      copy:
+        dest: "{{ web_root_dir }}/healthz"
+        content: |
+          {"status":"healthy","release":"{{ release_version }}","node":"{{ ansible_hostname }}","timestamp":"{{ ansible_date_time.iso8601 }}"}
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: "0644"
+      tags:
+        - web
+        - healthcheck
 
     - name: Deploy production index.html landing page
       copy:
